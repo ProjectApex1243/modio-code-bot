@@ -21,8 +21,12 @@ from supabase_rooms import fetch_active_rooms
 load_dotenv()
 
 FIND_ACTIVE_ROOMS_COMMAND_NAME = "find-active-rooms"
-MAX_ROOMS_TO_LIST = 5
 MAX_LOOKUP_MATCHES = 8
+# High cap so we effectively fetch every active room the RPC knows about.
+ROOM_FETCH_LIMIT = 1000
+# Discord caps a single embed field value at 1024 chars, so we split the
+# room list across multiple fields when it gets long.
+EMBED_FIELD_CHAR_LIMIT = 1024
 EMBED_COLOR = 0x57F287
 STAFF_ROLE_NAME = "Staff"
 
@@ -78,7 +82,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         try:
             rooms = await fetch_active_rooms(
-                client.http_session, SUPABASE_URL, SUPABASE_ANON_KEY, MAX_ROOMS_TO_LIST
+                client.http_session, SUPABASE_URL, SUPABASE_ANON_KEY, ROOM_FETCH_LIMIT
             )
             await interaction.followup.send(embed=build_rooms_embed(rooms))
         except Exception as error:
@@ -151,7 +155,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
 
 def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
-    """Most populated room up top, plus a short leaderboard of the next busiest rooms."""
+    """Lists every active room (most populated first), split across fields so we
+    never blow past Discord's 1024-char-per-field limit."""
     if not rooms:
         return discord.Embed(
             title="No active public rooms right now",
@@ -159,26 +164,43 @@ def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
             color=EMBED_COLOR,
         )
 
-    top_room = rooms[0]
-    runner_ups = rooms[1:MAX_ROOMS_TO_LIST]
-
-    top_count = top_room["playerCount"]
+    total_players = sum(int(room.get("playerCount") or 0) for room in rooms)
     embed = discord.Embed(
-        title="Most populated room",
-        description=(
-            f"**{top_room['roomId']}** — {top_count} player{'' if top_count == 1 else 's'}\n"
-            f"Zone: {top_room.get('zone') or 'Unknown'} | Region: {top_room.get('region') or 'Unknown'}"
-        ),
+        title=f"Active rooms ({len(rooms)})",
+        description=f"Total players across all rooms: **{total_players}**",
         color=EMBED_COLOR,
     )
 
-    if runner_ups:
-        lines = "\n".join(
-            f"{room['roomId']} — {room['playerCount']} player{'' if room['playerCount'] == 1 else 's'} "
-            f"({room.get('region') or 'Unknown'})"
-            for room in runner_ups
+    lines = [
+        f"{room['roomId']} — {room['playerCount']} player{'' if room['playerCount'] == 1 else 's'} "
+        f"({room.get('region') or 'Unknown'}, {room.get('zone') or 'Unknown'})"
+        for room in rooms
+    ]
+
+    # Pack as many room lines as fit into each 1024-char field, then start a new field.
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        # +1 accounts for the "\n" that joins lines together.
+        line_len = len(line) + (1 if current else 0)
+        if current and current_len + line_len > EMBED_FIELD_CHAR_LIMIT:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+            line_len = len(line)  # no leading newline on the first line of a chunk
+        current.append(line)
+        current_len += line_len
+
+    if current:
+        chunks.append("\n".join(current))
+
+    for index, chunk in enumerate(chunks):
+        embed.add_field(
+            name="Rooms" if index == 0 else f"Rooms (continued, {index + 1})",
+            value=chunk,
+            inline=False,
         )
-        embed.add_field(name="Other active rooms", value=lines, inline=False)
 
     return embed
 
