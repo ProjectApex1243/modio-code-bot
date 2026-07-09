@@ -130,6 +130,11 @@ async def start_health_check_server() -> None:
 
 
 def main() -> None:
+    # TEMPORARY: reports which required env vars the process can actually see, without leaking
+    # their values, so a Render dashboard/env-var mismatch shows up immediately in the logs.
+    for name in ("DISCORD_TOKEN", "SUPABASE_URL", "SUPABASE_ANON_KEY"):
+        logger.info("%s is %s", name, "set" if os.environ.get(name) else "MISSING")
+
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not set.")
     if not SUPABASE_URL:
