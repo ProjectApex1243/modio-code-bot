@@ -1,87 +1,131 @@
 import os
-import asyncio
+import logging
+
+import aiohttp
 import discord
-from discord import app_commands
 from aiohttp import web
-from supabase import acreate_client, AsyncClient
+from discord import app_commands
+from dotenv import load_dotenv
 
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
-LOG_CHANNEL_ID = int(os.environ["LOG_CHANNEL_ID"])
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+from supabase_rooms import fetch_active_rooms
 
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-supabase: AsyncClient | None = None
+load_dotenv()
+
+FIND_ACTIVE_ROOMS_COMMAND_NAME = "find-active-rooms"
+MAX_ROOMS_TO_LIST = 5
+EMBED_COLOR = 0x57F287
+
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
+DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+# Render sets PORT automatically for Web Services; default covers local runs.
+HEALTH_CHECK_PORT = int(os.environ.get("PORT", "8080"))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("room-bot")
 
 
-@tree.command(
-    name="code",
-    description="Fetch the latest mod.io login code for an email",
-    guild=discord.Object(id=GUILD_ID),
-)
-@app_commands.describe(email="vstump_<id>@yourdomain")
-async def code(interaction: discord.Interaction, email: str):
-    res = (
-        await supabase.table("modio_login_codes")
-        .select("code, created_at")
-        .eq("email", email)
-        .order("created_at", desc=True)
-        .limit(1)
-        .execute()
+class RoomBot(discord.Client):
+    """Discord client that owns one slash command and one shared HTTP session."""
+
+    def __init__(self) -> None:
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
+        self.http_session: aiohttp.ClientSession | None = None
+
+    async def setup_hook(self) -> None:
+        self.http_session = aiohttp.ClientSession()
+        register_commands(self.tree)
+
+        if DISCORD_GUILD_ID:
+            guild = discord.Object(id=int(DISCORD_GUILD_ID))
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            logger.info("Synced commands to guild %s.", DISCORD_GUILD_ID)
+        else:
+            await self.tree.sync()
+            logger.info("Synced commands globally (may take up to an hour to appear).")
+
+        await start_health_check_server()
+
+    async def close(self) -> None:
+        if self.http_session is not None:
+            await self.http_session.close()
+        await super().close()
+
+
+def register_commands(tree: app_commands.CommandTree) -> None:
+    @tree.command(
+        name=FIND_ACTIVE_ROOMS_COMMAND_NAME,
+        description="Shows the most populated Gorilla Tag room right now, without opening the game.",
     )
-    rows = res.data
-    if rows:
-        await interaction.response.send_message(
-            f"Code for **{email}**: `{rows[0]['code']}`", ephemeral=True
+    async def find_active_rooms(interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            rooms = await fetch_active_rooms(
+                client.http_session, SUPABASE_URL, SUPABASE_ANON_KEY, MAX_ROOMS_TO_LIST
+            )
+            await interaction.followup.send(embed=build_rooms_embed(rooms))
+        except Exception:
+            logger.exception("Error handling /%s", FIND_ACTIVE_ROOMS_COMMAND_NAME)
+            await interaction.followup.send("Couldn't reach the room database just now. Try again in a moment.")
+
+
+def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
+    """Most populated room up top, plus a short leaderboard of the next busiest rooms."""
+    if not rooms:
+        return discord.Embed(
+            title="No active public rooms right now",
+            description="Nobody with public presence enabled is currently in a room.",
+            color=EMBED_COLOR,
         )
-    else:
-        await interaction.response.send_message(
-            f"No code found for **{email}**.", ephemeral=True
+
+    top_room = rooms[0]
+    runner_ups = rooms[1:MAX_ROOMS_TO_LIST]
+
+    top_count = top_room["playerCount"]
+    embed = discord.Embed(
+        title="Most populated room",
+        description=(
+            f"**{top_room['roomId']}** — {top_count} player{'' if top_count == 1 else 's'}\n"
+            f"Zone: {top_room.get('zone') or 'Unknown'} | Region: {top_room.get('region') or 'Unknown'}"
+        ),
+        color=EMBED_COLOR,
+    )
+
+    if runner_ups:
+        lines = "\n".join(
+            f"{room['roomId']} — {room['playerCount']} player{'' if room['playerCount'] == 1 else 's'} "
+            f"({room.get('region') or 'Unknown'})"
+            for room in runner_ups
         )
+        embed.add_field(name="Other active rooms", value=lines, inline=False)
+
+    return embed
 
 
-async def handle_insert(payload):
-    data = payload.get("data", payload)
-    record = data.get("record") or data.get("new") or {}
-    channel = client.get_channel(LOG_CHANNEL_ID) or await client.fetch_channel(LOG_CHANNEL_ID)
-    embed = discord.Embed(title="New mod.io code")
-    embed.add_field(name="Email", value=f"`{record.get('email', '?')}`", inline=False)
-    embed.add_field(name="Code", value=f"`{record.get('code', '?')}`", inline=False)
-    await channel.send(embed=embed)
-
-
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user}")
-    await tree.sync(guild=discord.Object(id=GUILD_ID))
-    realtime = supabase.channel("modio_codes")
-    await realtime.on_postgres_changes(
-        "INSERT", schema="public", table="modio_login_codes", callback=handle_insert
-    ).subscribe()
-
-
-# Keep-alive HTTP server so Render's free Web Service stays bound to a port.
-# Not needed if you deploy as a Background Worker.
-async def start_keepalive():
-    port = os.environ.get("PORT")
-    if not port:
-        return
+async def start_health_check_server() -> None:
+    """Binds an HTTP port so Render's Web Service health check passes."""
     app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    app.router.add_get("/", lambda _request: web.Response(text="ok"))
+
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    site = web.TCPSite(runner, host="0.0.0.0", port=HEALTH_CHECK_PORT)
+    await site.start()
+    logger.info("Health check server listening on port %s.", HEALTH_CHECK_PORT)
 
 
-async def main():
-    global supabase
-    supabase = await acreate_client(SUPABASE_URL, SUPABASE_KEY)
-    await start_keepalive()
-    async with client:
-        await client.start(DISCORD_TOKEN)
+def main() -> None:
+    if not DISCORD_TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is not set.")
+
+    bot = RoomBot()
+    bot.run(DISCORD_TOKEN)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    main()
