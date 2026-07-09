@@ -8,6 +8,7 @@ supabase_rooms.py so this file stays focused on Discord + hosting wiring.
 
 import os
 import logging
+import re
 
 import aiohttp
 import discord
@@ -29,6 +30,7 @@ ROOM_FETCH_LIMIT = 1000
 EMBED_FIELD_CHAR_LIMIT = 1024
 EMBED_COLOR = 0x57F287
 STAFF_ROLE_NAME = "Staff"
+RANK_BADGES = ["🥇", "🥈", "🥉"]
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
@@ -146,36 +148,51 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
         logger.exception("Unhandled app command error: %s", error)
-        if interaction.response.is_done():
-            await interaction.followup.send("Something went wrong running that command.")
-        else:
-            await interaction.response.send_message(
-                "Something went wrong running that command.", ephemeral=True
-            )
+        # If the interaction token is gone (restart/expiry), there's nothing we
+        # can reply to — just log it instead of cascading into another error.
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Something went wrong running that command.")
+            else:
+                await interaction.response.send_message(
+                    "Something went wrong running that command.", ephemeral=True
+                )
+        except discord.NotFound:
+            logger.warning("Interaction expired or unknown; could not send error reply.")
+
+
+def _clean_room_name(name: str) -> str:
+    """Strip Unity rich-text markup (e.g. <size=1000%>😎</size> -> 😎) so room
+    names render cleanly inside Discord instead of showing raw tags."""
+    cleaned = re.sub(r"<[^>]+>", "", name or "").strip()
+    return cleaned or (name or "Unknown")
 
 
 def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
-    """Lists every active room (most populated first), split across fields so we
-    never blow past Discord's 1024-char-per-field limit."""
+    """Lists every active room (most populated first) with rank badges, split
+    across fields so we never blow past Discord's 1024-char-per-field limit."""
     if not rooms:
         return discord.Embed(
-            title="No active public rooms right now",
+            title="💤 No active public rooms right now",
             description="Nobody with public presence enabled is currently in a room.",
             color=EMBED_COLOR,
         )
 
     total_players = sum(int(room.get("playerCount") or 0) for room in rooms)
     embed = discord.Embed(
-        title=f"Active rooms ({len(rooms)})",
-        description=f"Total players across all rooms: **{total_players}**",
+        title=f"🎮 Active rooms ({len(rooms)})",
+        description=f"👥 **{total_players}** player{'s' if total_players != 1 else ''} online across all rooms",
         color=EMBED_COLOR,
     )
 
-    lines = [
-        f"{room['roomId']} — {room['playerCount']} player{'' if room['playerCount'] == 1 else 's'} "
-        f"({room.get('region') or 'Unknown'}, {room.get('zone') or 'Unknown'})"
-        for room in rooms
-    ]
+    lines = []
+    for rank, room in enumerate(rooms, start=1):
+        badge = RANK_BADGES[rank - 1] if rank <= len(RANK_BADGES) else f"`#{rank}`"
+        name = _clean_room_name(str(room.get("roomId") or "Unknown"))
+        players = int(room.get("playerCount") or 0)
+        region = room.get("region") or "Unknown"
+        zone = room.get("zone") or "Unknown"
+        lines.append(f"{badge} **{name}** — 👥 {players} · 📍 {region} / {zone}")
 
     # Pack as many room lines as fit into each 1024-char field, then start a new field.
     chunks: list[str] = []
@@ -197,7 +214,7 @@ def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
 
     for index, chunk in enumerate(chunks):
         embed.add_field(
-            name="Rooms" if index == 0 else f"Rooms (continued, {index + 1})",
+            name="🏠 Rooms" if index == 0 else f"🏠 Rooms (continued, {index + 1})",
             value=chunk,
             inline=False,
         )
