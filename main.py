@@ -66,7 +66,7 @@ class RoomBot(discord.Client):
 def register_commands(tree: app_commands.CommandTree) -> None:
     @tree.command(
         name=FIND_ACTIVE_ROOMS_COMMAND_NAME,
-        description="Shows the most populated Gorilla Tag room right now, without opening the game.",
+        description="Shows the Most Active Rooms It Can find IN the Game ",
     )
     async def find_active_rooms(interaction: discord.Interaction) -> None:
         await interaction.response.defer()
