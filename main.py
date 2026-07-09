@@ -1,3 +1,11 @@
+"""Entry point for the bot process. Run with: python bot.py
+
+Handles the /find-active-rooms slash command and a tiny HTTP health endpoint
+(required by Render's Web Service health check, since the Discord gateway
+connection alone doesn't bind a port). Supabase access lives entirely in
+supabase_rooms.py so this file stays focused on Discord + hosting wiring.
+"""
+
 import os
 import logging
 
@@ -69,9 +77,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 client.http_session, SUPABASE_URL, SUPABASE_ANON_KEY, MAX_ROOMS_TO_LIST
             )
             await interaction.followup.send(embed=build_rooms_embed(rooms))
-        except Exception:
+        except Exception as error:
             logger.exception("Error handling /%s", FIND_ACTIVE_ROOMS_COMMAND_NAME)
-            await interaction.followup.send("Couldn't reach the room database just now. Try again in a moment.")
+            # TEMPORARY: surface the real error in Discord for debugging. Revert to the generic
+            # message once get_active_rooms is confirmed working end to end.
+            await interaction.followup.send(f"Debug — request failed: `{error}`")
 
 
 def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
@@ -122,6 +132,10 @@ async def start_health_check_server() -> None:
 def main() -> None:
     if not DISCORD_TOKEN:
         raise RuntimeError("DISCORD_TOKEN is not set.")
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL is not set.")
+    if not SUPABASE_ANON_KEY:
+        raise RuntimeError("SUPABASE_ANON_KEY is not set.")
 
     bot = RoomBot()
     bot.run(DISCORD_TOKEN)
