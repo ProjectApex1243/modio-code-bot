@@ -9,6 +9,7 @@ supabase_rooms.py so this file stays focused on Discord + hosting wiring.
 import os
 import logging
 import re
+from datetime import datetime
 
 import aiohttp
 import discord
@@ -17,6 +18,13 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from cosmetics import search_cosmetics
+from redeem_codes import (
+    create_code,
+    generate_code,
+    parse_duration,
+    resolve_items,
+    validate_code,
+)
 from supabase_rooms import fetch_active_rooms
 
 load_dotenv()
@@ -30,12 +38,17 @@ ROOM_FETCH_LIMIT = 1000
 EMBED_FIELD_CHAR_LIMIT = 1024
 EMBED_COLOR = 0x57F287
 STAFF_ROLE_NAME = "Staff"
+# Redemption-code commands are gated behind this role instead of Staff.
+SUPA_MANAGER_ROLE_NAME = "Supa Manager"
 RANK_BADGES = ["🥇", "🥈", "🥉"]
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+# Service role key is required for /create-code: redemption_codes has RLS with no
+# policies, so only the service role can insert. Keep this key bot-side only.
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 # Render sets PORT automatically for Web Services; default covers local runs.
 HEALTH_CHECK_PORT = int(os.environ.get("PORT", "8080"))
 
@@ -126,6 +139,91 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 inline=False,
             )
         await interaction.response.send_message(embed=embed)
+
+    @tree.command(
+        name="create-code",
+        description="Create an in-game redemption code and push it to Supabase.",
+    )
+    @app_commands.describe(
+        items="Cosmetics to grant, comma-separated item IDs or names (use /lookup to find them)",
+        duration="How long the code stays live, e.g. 30m, 1h, 2d, 1w (blank = never expires)",
+        max_uses="Total number of players that can redeem it (blank = unlimited)",
+        code="Custom 8-character code, A-Z/0-9 only (blank = random)",
+    )
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def create_code_command(
+        interaction: discord.Interaction,
+        items: str,
+        duration: str | None = None,
+        max_uses: app_commands.Range[int, 1] | None = None,
+        code: str | None = None,
+    ) -> None:
+        # Ephemeral: anyone who sees a code can redeem it, so only show the creator.
+        await interaction.response.defer(ephemeral=True)
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        if not SUPABASE_SERVICE_ROLE_KEY:
+            await interaction.followup.send(
+                "`SUPABASE_SERVICE_ROLE_KEY` is not set on the bot, so it can't "
+                "insert codes. Add it to the environment and restart."
+            )
+            return
+
+        try:
+            final_code = validate_code(code) if code else generate_code()
+            expires_in = parse_duration(duration) if duration else None
+            item_ids, unknown = resolve_items(items)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        try:
+            row = await create_code(
+                client.http_session,
+                SUPABASE_URL,
+                SUPABASE_SERVICE_ROLE_KEY,
+                final_code,
+                item_ids,
+                max_uses,
+                expires_in,
+            )
+        except RuntimeError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        embed = discord.Embed(title="✅ Redemption code created", color=EMBED_COLOR)
+        # Code block so Discord shows a copy button next to the code.
+        embed.add_field(name="Code", value=f"```\n{final_code}\n```", inline=False)
+        embed.add_field(
+            name="Grants",
+            value="\n".join(f"`{item_id}`" for item_id in item_ids),
+            inline=False,
+        )
+        embed.add_field(
+            name="Max uses",
+            value=str(max_uses) if max_uses else "Unlimited (once per player)",
+            inline=True,
+        )
+        if row.get("expires_at"):
+            expiry_unix = int(
+                datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00")).timestamp()
+            )
+            embed.add_field(
+                name="Expires", value=f"<t:{expiry_unix}:f> (<t:{expiry_unix}:R>)", inline=True
+            )
+        else:
+            embed.add_field(name="Expires", value="Never", inline=True)
+        if unknown:
+            embed.add_field(
+                name="⚠️ Not found in cosmetics.json",
+                value=(
+                    "\n".join(f"`{token}`" for token in unknown)
+                    + "\nStored as typed — make sure these match the game's item IDs "
+                    "exactly, or they won't grant anything."
+                ),
+                inline=False,
+            )
+        await interaction.followup.send(embed=embed)
 
     @lookup.autocomplete("cosmetic")
     async def lookup_autocomplete(
@@ -237,7 +335,7 @@ async def start_health_check_server() -> None:
 def main() -> None:
     # TEMPORARY: reports which required env vars the process can actually see, without leaking
     # their values, so a Render dashboard/env-var mismatch shows up immediately in the logs.
-    for name in ("DISCORD_TOKEN", "SUPABASE_URL", "SUPABASE_ANON_KEY"):
+    for name in ("DISCORD_TOKEN", "SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY"):
         logger.info("%s is %s", name, "set" if os.environ.get(name) else "MISSING")
 
     if not DISCORD_TOKEN:
