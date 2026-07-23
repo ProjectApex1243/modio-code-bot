@@ -6,10 +6,11 @@ connection alone doesn't bind a port). Supabase access lives entirely in
 supabase_rooms.py so this file stays focused on Discord + hosting wiring.
 """
 
+import asyncio
 import os
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import discord
@@ -40,6 +41,14 @@ EMBED_COLOR = 0x57F287
 STAFF_ROLE_NAME = "Staff"
 # Redemption-code commands are gated behind this role instead of Staff.
 SUPA_MANAGER_ROLE_NAME = "Supa Manager"
+# Role that /prune-unverified targets. Owner-only, so it isn't gated by a role check.
+UNVERIFIED_ROLE_NAME = "Unverified"
+# Seconds between kicks. Discord's per-guild kick bucket is tight; a small gap
+# keeps a large prune from stalling on 429s.
+PRUNE_KICK_DELAY = 1.0
+# How long the confirmation buttons stay clickable.
+PRUNE_CONFIRM_TIMEOUT = 120
+EMBED_RED = 0xED4245
 RANK_BADGES = ["🥇", "🥈", "🥉"]
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -60,7 +69,12 @@ class RoomBot(discord.Client):
     """Discord client that owns one slash command and one shared HTTP session."""
 
     def __init__(self) -> None:
-        super().__init__(intents=discord.Intents.default())
+        # members intent is privileged: /prune-unverified can't list who holds a
+        # role without it. Must also be toggled on in the Discord developer portal
+        # (Bot -> Privileged Gateway Intents -> Server Members Intent).
+        intents = discord.Intents.default()
+        intents.members = True
+        super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.http_session: aiohttp.ClientSession | None = None
 
@@ -83,6 +97,40 @@ class RoomBot(discord.Client):
         if self.http_session is not None:
             await self.http_session.close()
         await super().close()
+
+
+class PruneConfirmView(discord.ui.View):
+    """Yes/no buttons shown before a prune actually kicks anyone. Only the member
+    who ran the command can press them."""
+
+    def __init__(self, invoker_id: int) -> None:
+        super().__init__(timeout=PRUNE_CONFIRM_TIMEOUT)
+        self.invoker_id = invoker_id
+        self.confirmed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "This confirmation isn't yours.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Kick them", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.confirmed = True
+        await interaction.response.edit_message(content="Kicking…", embed=None, view=None)
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.confirmed = False
+        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+        self.stop()
 
 
 def register_commands(tree: app_commands.CommandTree) -> None:
@@ -224,6 +272,148 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 inline=False,
             )
         await interaction.followup.send(embed=embed)
+
+    @tree.command(
+        name="prune-unverified",
+        description=f"Kick every member with the {UNVERIFIED_ROLE_NAME} role. Server owner only.",
+    )
+    @app_commands.describe(
+        joined_days_ago="Only kick members who joined at least this many days ago (blank = all)",
+        preview="Just show who would be kicked, without kicking anyone",
+    )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    async def prune_unverified(
+        interaction: discord.Interaction,
+        joined_days_ago: app_commands.Range[int, 0] | None = None,
+        preview: bool = False,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This command only works inside a server.", ephemeral=True
+            )
+            return
+        # Owner-only by design: this can empty a large chunk of the member list.
+        if interaction.user.id != guild.owner_id:
+            await interaction.response.send_message(
+                "Only the **server owner** can use this command.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        role = discord.utils.get(guild.roles, name=UNVERIFIED_ROLE_NAME)
+        if role is None:
+            await interaction.followup.send(
+                f"No role named **{UNVERIFIED_ROLE_NAME}** exists in this server."
+            )
+            return
+        if not guild.me.guild_permissions.kick_members:
+            await interaction.followup.send(
+                "I don't have the **Kick Members** permission in this server."
+            )
+            return
+
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=joined_days_ago)
+            if joined_days_ago
+            else None
+        )
+        # fetch_members hits the gateway directly, so this works even if the member
+        # cache hasn't finished chunking a big guild yet.
+        kickable: list[discord.Member] = []
+        skipped_hierarchy = 0
+        skipped_recent = 0
+        skipped_bots = 0
+        async for member in guild.fetch_members(limit=None):
+            if role not in member.roles:
+                continue
+            if member.bot:
+                skipped_bots += 1
+                continue
+            if cutoff and (member.joined_at is None or member.joined_at > cutoff):
+                skipped_recent += 1
+                continue
+            # Can't kick the owner, or anyone at/above the bot's highest role.
+            if member.id == guild.owner_id or member.top_role >= guild.me.top_role:
+                skipped_hierarchy += 1
+                continue
+            kickable.append(member)
+
+        notes = []
+        if skipped_recent:
+            notes.append(f"{skipped_recent} joined too recently")
+        if skipped_hierarchy:
+            notes.append(f"{skipped_hierarchy} above me in the role list")
+        if skipped_bots:
+            notes.append(f"{skipped_bots} bots")
+        note_line = f"\n\nSkipped: {', '.join(notes)}." if notes else ""
+
+        if not kickable:
+            await interaction.followup.send(
+                f"Nobody to kick — no eligible members have the **{UNVERIFIED_ROLE_NAME}** "
+                f"role.{note_line}"
+            )
+            return
+
+        window = f" who joined {joined_days_ago}+ days ago" if joined_days_ago else ""
+        preview_names = ", ".join(m.display_name for m in kickable[:15])
+        if len(kickable) > 15:
+            preview_names += f", …and {len(kickable) - 15} more"
+
+        if preview:
+            await interaction.followup.send(
+                f"**Preview only — nobody was kicked.**\n"
+                f"**{len(kickable)}** member(s) with **{UNVERIFIED_ROLE_NAME}**{window} "
+                f"would be kicked:\n{preview_names}{note_line}"
+            )
+            return
+
+        confirm_embed = discord.Embed(
+            title="⚠️ Confirm prune",
+            description=(
+                f"This will kick **{len(kickable)}** member(s) holding the "
+                f"**{UNVERIFIED_ROLE_NAME}** role{window}.\n\n{preview_names}{note_line}\n\n"
+                "They can rejoin with a new invite. This cannot be undone otherwise."
+            ),
+            color=EMBED_RED,
+        )
+        view = PruneConfirmView(interaction.user.id)
+        await interaction.followup.send(embed=confirm_embed, view=view)
+
+        if await view.wait():
+            await interaction.followup.send("Timed out — nobody was kicked.", ephemeral=True)
+            return
+        if not view.confirmed:
+            await interaction.followup.send("Cancelled — nobody was kicked.", ephemeral=True)
+            return
+
+        reason = f"Prune: {UNVERIFIED_ROLE_NAME} role, by {interaction.user} ({interaction.user.id})"
+        kicked = 0
+        failed = 0
+        for index, member in enumerate(kickable):
+            try:
+                await member.kick(reason=reason)
+                kicked += 1
+            except discord.HTTPException as error:
+                failed += 1
+                logger.warning("Failed to kick %s (%s): %s", member, member.id, error)
+            # Progress ping every 25 so a long prune doesn't look frozen.
+            if kicked and kicked % 25 == 0:
+                await interaction.followup.send(
+                    f"…{kicked}/{len(kickable)} kicked so far.", ephemeral=True
+                )
+            if index < len(kickable) - 1:
+                await asyncio.sleep(PRUNE_KICK_DELAY)
+
+        result = discord.Embed(
+            title="🧹 Prune complete",
+            description=f"Kicked **{kicked}** member(s) with the **{UNVERIFIED_ROLE_NAME}** role."
+            + (f"\n⚠️ **{failed}** could not be kicked (see bot logs)." if failed else ""),
+            color=EMBED_COLOR if not failed else EMBED_RED,
+        )
+        await interaction.followup.send(embed=result)
 
     @lookup.autocomplete("cosmetic")
     async def lookup_autocomplete(
