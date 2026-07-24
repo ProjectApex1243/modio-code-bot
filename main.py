@@ -449,6 +449,19 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             logger.warning("Interaction expired or unknown; could not send error reply.")
 
 
+def _room_private_code(room: dict) -> str | None:
+    """Pulls the private join code out of a room row, if the RPC returned one.
+
+    get_active_rooms has used a few different key spellings for this, so we accept
+    any of them rather than hard-coding one.
+    """
+    for key in ("privateCode", "privCode", "private_code", "roomCode", "room_code", "joinCode"):
+        value = room.get(key)
+        if value not in (None, "", 0):
+            return str(value).strip()
+    return None
+
+
 def _clean_room_name(name: str) -> str:
     """Strip Unity rich-text markup (e.g. <size=1000%>😎</size> -> 😎) so room
     names render cleanly inside Discord instead of showing raw tags."""
@@ -480,7 +493,11 @@ def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
         players = int(room.get("playerCount") or 0)
         region = room.get("region") or "Unknown"
         zone = room.get("zone") or "Unknown"
-        lines.append(f"{badge} **{name}** — 👥 {players} · 📍 {region} / {zone}")
+        line = f"{badge} **{name}** — 👥 {players} · 📍 {region} / {zone}"
+        private_code = _room_private_code(room)
+        if private_code:
+            line += f" · 🔒 `{private_code}`"
+        lines.append(line)
 
     # Pack as many room lines as fit into each 1024-char field, then start a new field.
     chunks: list[str] = []
