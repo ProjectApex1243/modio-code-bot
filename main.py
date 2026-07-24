@@ -474,8 +474,8 @@ def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
     across fields so we never blow past Discord's 1024-char-per-field limit."""
     if not rooms:
         return discord.Embed(
-            title="💤 No active public rooms right now",
-            description="Nobody with public presence enabled is currently in a room.",
+            title="💤 No active rooms right now",
+            description="Nobody has sent a room heartbeat in the last couple of minutes.",
             color=EMBED_COLOR,
         )
 
@@ -497,6 +497,9 @@ def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
         private_code = _room_private_code(room)
         if private_code:
             line += f" · 🔒 `{private_code}`"
+        elif room.get("isPrivate"):
+            # Private, but the RPC didn't hand back a code for it.
+            line += " · 🔒 private"
         lines.append(line)
 
     # Pack as many room lines as fit into each 1024-char field, then start a new field.
