@@ -18,7 +18,9 @@ async def fetch_active_rooms(
 ) -> list[dict[str, Any]]:
     """Fetches the currently active public rooms, sorted by player count descending.
 
-    Each item has: roomId (str), zone (str), region (str), playerCount (int).
+    Each item has: roomId (str), zone (str), region (str), playerCount (int), and
+    optionally a private join code (privateCode / privCode / roomCode — the RPC has
+    used several spellings; main.py accepts any of them).
     """
     endpoint = f"{supabase_url}/rest/v1/rpc/get_active_rooms"
     headers = {
