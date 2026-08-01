@@ -26,7 +26,7 @@ from redeem_codes import (
     resolve_items,
     validate_code,
 )
-from supabase_rooms import fetch_active_rooms
+from supabase_rooms import fetch_active_rooms, fetch_room_players, normalize_room_key
 
 load_dotenv()
 
@@ -37,6 +37,11 @@ ROOM_FETCH_LIMIT = 1000
 # Discord caps a single embed field value at 1024 chars, so we split the
 # room list across multiple fields when it gets long.
 EMBED_FIELD_CHAR_LIMIT = 1024
+# Names listed under each room before we collapse the rest into "+N more".
+MAX_PLAYER_NAMES_PER_ROOM = 12
+# Discord rejects an embed whose total content passes 6000 chars, so with 1024-char
+# fields we can afford five of them plus the title and description.
+MAX_EMBED_FIELDS = 5
 EMBED_COLOR = 0x57F287
 STAFF_ROLE_NAME = "Staff"
 # Redemption-code commands are gated behind this role instead of Staff.
@@ -147,7 +152,19 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             rooms = await fetch_active_rooms(
                 client.http_session, SUPABASE_URL, SUPABASE_ANON_KEY, ROOM_FETCH_LIMIT
             )
-            await interaction.followup.send(embed=build_rooms_embed(rooms))
+            # Who's in each room is a nice-to-have on top of the counts, and
+            # friendpresence may be locked down by RLS, so a failure here only
+            # costs us the name lists — the room list still goes out.
+            players_by_room: dict[str, list[str]] = {}
+            try:
+                players_by_room = await fetch_room_players(
+                    client.http_session,
+                    SUPABASE_URL,
+                    SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY,
+                )
+            except Exception:
+                logger.exception("Could not read player names from friendpresence")
+            await interaction.followup.send(embed=build_rooms_embed(rooms, players_by_room))
         except Exception as error:
             logger.exception("Error handling /%s", FIND_ACTIVE_ROOMS_COMMAND_NAME)
             # TEMPORARY: surface the real error in Discord for debugging. Revert to the generic
@@ -469,9 +486,23 @@ def _clean_room_name(name: str) -> str:
     return cleaned or (name or "Unknown")
 
 
-def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
-    """Lists every active room (most populated first) with rank badges, split
-    across fields so we never blow past Discord's 1024-char-per-field limit."""
+def _players_line(names: list[str]) -> str:
+    """One indented line naming everyone in a room, trimmed to a sane length."""
+    cleaned = [_clean_room_name(name) for name in names]
+    shown = cleaned[:MAX_PLAYER_NAMES_PER_ROOM]
+    text = ", ".join(shown)
+    remaining = len(cleaned) - len(shown)
+    if remaining > 0:
+        text += f" +{remaining} more"
+    return f"　└ 👤 {text}"
+
+
+def build_rooms_embed(
+    rooms: list[dict], players_by_room: dict[str, list[str]] | None = None
+) -> discord.Embed:
+    """Lists every active room (most populated first) with rank badges and the
+    players inside each one, split across fields so we never blow past Discord's
+    1024-char-per-field limit."""
     if not rooms:
         return discord.Embed(
             title="💤 No active rooms right now",
@@ -486,46 +517,65 @@ def build_rooms_embed(rooms: list[dict]) -> discord.Embed:
         color=EMBED_COLOR,
     )
 
-    lines = []
+    players_by_room = players_by_room or {}
+    entries = []
     for rank, room in enumerate(rooms, start=1):
         badge = RANK_BADGES[rank - 1] if rank <= len(RANK_BADGES) else f"`#{rank}`"
-        name = _clean_room_name(str(room.get("roomId") or "Unknown"))
+        room_id = str(room.get("roomId") or "Unknown")
+        name = _clean_room_name(room_id)
         players = int(room.get("playerCount") or 0)
         region = room.get("region") or "Unknown"
         zone = room.get("zone") or "Unknown"
-        line = f"{badge} **{name}** — 👥 {players} · 📍 {region} / {zone}"
+        entry = f"{badge} **{name}** — 👥 {players} · 📍 {region} / {zone}"
         private_code = _room_private_code(room)
         if private_code:
-            line += f" · 🔒 `{private_code}`"
+            entry += f" · 🔒 `{private_code}`"
         elif room.get("isPrivate"):
             # Private, but the RPC didn't hand back a code for it.
-            line += " · 🔒 private"
-        lines.append(line)
+            entry += " · 🔒 private"
 
-    # Pack as many room lines as fit into each 1024-char field, then start a new field.
-    chunks: list[str] = []
+        # Names come from friendpresence keyed by room id; a private room is also
+        # looked up by its join code in case presence stores the code instead.
+        names = players_by_room.get(normalize_room_key(room_id))
+        if not names and private_code:
+            names = players_by_room.get(normalize_room_key(private_code))
+        if names:
+            entry += "\n" + _players_line(names)
+        entries.append(entry[:EMBED_FIELD_CHAR_LIMIT])
+
+    # Pack as many room entries as fit into each 1024-char field, then start a new
+    # field. An entry is a room and its player list, kept together.
+    chunks: list[list[str]] = []
     current: list[str] = []
     current_len = 0
-    for line in lines:
-        # +1 accounts for the "\n" that joins lines together.
-        line_len = len(line) + (1 if current else 0)
-        if current and current_len + line_len > EMBED_FIELD_CHAR_LIMIT:
-            chunks.append("\n".join(current))
+    for entry in entries:
+        # +1 accounts for the "\n" that joins entries together.
+        entry_len = len(entry) + (1 if current else 0)
+        if current and current_len + entry_len > EMBED_FIELD_CHAR_LIMIT:
+            chunks.append(current)
             current = []
             current_len = 0
-            line_len = len(line)  # no leading newline on the first line of a chunk
-        current.append(line)
-        current_len += line_len
+            entry_len = len(entry)  # no leading newline on the first entry of a chunk
+        current.append(entry)
+        current_len += entry_len
 
     if current:
-        chunks.append("\n".join(current))
+        chunks.append(current)
 
-    for index, chunk in enumerate(chunks):
+    # Listing every player makes each room entry roughly twice as tall, so cap the
+    # fields: Discord rejects an embed over 6000 characters outright.
+    shown_chunks = chunks[:MAX_EMBED_FIELDS]
+    hidden_rooms = sum(len(chunk) for chunk in chunks[len(shown_chunks):])
+
+    for index, chunk in enumerate(shown_chunks):
         embed.add_field(
             name="🏠 Rooms" if index == 0 else f"🏠 Rooms (continued, {index + 1})",
-            value=chunk,
+            value="\n".join(chunk),
             inline=False,
         )
+
+    if hidden_rooms:
+        embed.set_footer(text=f"+{hidden_rooms} more room(s) not shown — too long for one message.")
 
     return embed
 
