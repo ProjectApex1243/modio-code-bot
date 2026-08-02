@@ -1,9 +1,15 @@
-"""Cosmetic name/ID lookup used by the /lookup slash command.
+"""Cosmetic catalog used by the /lookup slash command.
 
-The catalog lives in cosmetics.json as a list of compact entries:
-  ["LHAAA.", "BANANA HAT"]                     id + display name
-  ["LBASG."]                                   unnamed item (name == id)
-  ["LSAAA.", "CLOWN SET", ["LBAAL.", ...]]     optional bundled item ids
+cosmetics.json is generated from the Unity project (Assets/cosmetics_data.json)
+and holds one object per item:
+  {"id": "LHAAF.", "name": "BASEBALL CAP", "category": "Hat",
+   "cost": 1000, "image": "LHAAF.png", "bundled": ["LBAAL.", ...]}
+
+`image` names a file in cosmetic_images/ — the sprite cropped out of the game's
+texture atlas. It is "" for the handful of items with no in-game icon.
+
+The older compact list format (["LHAAF.", "BASEBALL CAP", [bundled ids]]) is
+still accepted so an out-of-date catalog doesn't break the bot.
 """
 
 import difflib
@@ -11,6 +17,29 @@ import json
 from pathlib import Path
 
 _CATALOG_PATH = Path(__file__).with_name("cosmetics.json")
+IMAGE_DIR = Path(__file__).with_name("cosmetic_images")
+
+
+def _normalize(entry) -> dict:
+    if isinstance(entry, dict):
+        return {
+            "item_id": entry["id"],
+            "display_name": (entry.get("name") or entry["id"]).strip(),
+            "category": entry.get("category") or "",
+            "cost": entry.get("cost") or 0,
+            "image": entry.get("image") or "",
+            "bundled_items": entry.get("bundled") or [],
+        }
+    # Legacy list form.
+    item_id = entry[0]
+    return {
+        "item_id": item_id,
+        "display_name": (entry[1] if len(entry) > 1 else item_id).strip(),
+        "category": "",
+        "cost": 0,
+        "image": "",
+        "bundled_items": entry[2] if len(entry) > 2 else [],
+    }
 
 
 def _load_catalog() -> list[dict]:
@@ -20,22 +49,23 @@ def _load_catalog() -> list[dict]:
     items: list[dict] = []
     seen: set[str] = set()
     for entry in raw:
-        item_id = entry[0]
-        if item_id in seen:
+        item = _normalize(entry)
+        if item["item_id"] in seen:
             continue
-        seen.add(item_id)
-        display_name = entry[1] if len(entry) > 1 else item_id
-        items.append(
-            {
-                "item_id": item_id,
-                "display_name": display_name.strip(),
-                "bundled_items": entry[2] if len(entry) > 2 else [],
-            }
-        )
+        seen.add(item["item_id"])
+        items.append(item)
     return items
 
 
 COSMETICS = _load_catalog()
+
+
+def image_path(item: dict) -> Path | None:
+    """Local sprite file for an item, or None if it has no usable icon."""
+    if not item.get("image"):
+        return None
+    path = IMAGE_DIR / item["image"]
+    return path if path.is_file() else None
 
 
 def search_cosmetics(query: str, limit: int = 8) -> list[dict]:

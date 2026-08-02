@@ -18,7 +18,7 @@ from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
-from cosmetics import search_cosmetics
+from cosmetics import image_path, search_cosmetics
 from redeem_codes import (
     create_code,
     generate_code,
@@ -54,6 +54,9 @@ PRUNE_KICK_DELAY = 1.0
 # How long the confirmation buttons stay clickable.
 PRUNE_CONFIRM_TIMEOUT = 120
 EMBED_RED = 0xED4245
+# Sea green of the in-game cosmetic card header, so /lookup matches the store UI.
+EMBED_COSMETIC = 0x4E8877
+CURRENCY_NAME = "Shiny Rocks"
 RANK_BADGES = ["🥇", "🥈", "🥉"]
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -185,16 +188,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
             return
 
-        top = matches[0]
-        embed = discord.Embed(title=top["display_name"], color=EMBED_COLOR)
-        # Code block so Discord shows a copy button next to the ID.
-        embed.add_field(name="Item ID", value=f"```\n{top['item_id']}\n```", inline=False)
-        if top["bundled_items"]:
-            embed.add_field(
-                name="Bundled items",
-                value=" ".join(f"`{item_id}`" for item_id in top["bundled_items"]),
-                inline=False,
-            )
+        embed, files = build_cosmetic_embed(matches[0])
 
         similar = matches[1:]
         if similar:
@@ -203,7 +197,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 value="\n".join(f"{m['display_name']} — `{m['item_id']}`" for m in similar),
                 inline=False,
             )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, files=files)
 
     @tree.command(
         name="create-code",
@@ -495,6 +489,42 @@ def _players_line(names: list[str]) -> str:
     if remaining > 0:
         text += f" +{remaining} more"
     return f"　└ 👤 {text}"
+
+
+def build_cosmetic_embed(item: dict) -> tuple[discord.Embed, list[discord.File]]:
+    """Renders a cosmetic as the in-game store card: sprite on top, then an
+    Overview block of Name / ID / Category / Cost.
+
+    The sprite is uploaded alongside the message rather than linked, so the bot
+    works from a fresh clone without the repo needing to be public.
+    """
+    embed = discord.Embed(title=item["display_name"], color=EMBED_COSMETIC)
+
+    files: list[discord.File] = []
+    sprite = image_path(item)
+    if sprite:
+        # Discord matches attachment:// against the filename it was uploaded as.
+        files.append(discord.File(sprite, filename=sprite.name))
+        embed.set_image(url=f"attachment://{sprite.name}")
+
+    embed.add_field(name="Name", value=item["display_name"], inline=False)
+    # Code block so Discord shows a copy button next to the ID.
+    embed.add_field(name="ID", value=f"```\n{item['item_id']}\n```", inline=False)
+    if item["category"]:
+        embed.add_field(name="Category", value=item["category"], inline=True)
+    cost = item["cost"]
+    embed.add_field(
+        name="Cost",
+        value=f"{cost:,} {CURRENCY_NAME}" if cost else "Not purchasable",
+        inline=True,
+    )
+    if item["bundled_items"]:
+        embed.add_field(
+            name="Bundled items",
+            value=" ".join(f"`{item_id}`" for item_id in item["bundled_items"]),
+            inline=False,
+        )
+    return embed, files
 
 
 def build_rooms_embed(
