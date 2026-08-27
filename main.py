@@ -19,6 +19,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 import supa_admin
+import tickets
 from cosmetics import COSMETICS, display_name_for, image_path, search_cosmetics
 from redeem_codes import (
     create_code,
@@ -44,7 +45,9 @@ MAX_PLAYER_NAMES_PER_ROOM = 12
 # fields we can afford five of them plus the title and description.
 MAX_EMBED_FIELDS = 5
 EMBED_COLOR = 0x57F287
-STAFF_ROLE_NAME = "Staff"
+# Read from the environment so main.py and tickets.py can't drift apart if the
+# role is ever renamed.
+STAFF_ROLE_NAME = os.environ.get("STAFF_ROLE_NAME", "Staff")
 # Redemption-code commands are gated behind this role instead of Staff.
 SUPA_MANAGER_ROLE_NAME = "Supa Manager"
 # Role that /prune-unverified targets. Owner-only, so it isn't gated by a role check.
@@ -93,6 +96,9 @@ class RoomBot(discord.Client):
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
         register_commands(self.tree)
+        # Must happen before the gateway connects, or ticket buttons posted
+        # before the last restart come back dead.
+        tickets.register_persistent_views(self)
 
         if DISCORD_GUILD_ID:
             guild = discord.Object(id=int(DISCORD_GUILD_ID))
@@ -349,22 +355,44 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         except ValueError as error:
             await interaction.followup.send(str(error))
             return
+        # The RPC takes whole hours, so anything under an hour becomes one hour —
+        # say so rather than quietly serving a longer ban than was asked for.
+        rounded_note = None
+        if ban_length is not None:
+            hours = supa_admin.duration_to_hours(ban_length)
+            if abs(ban_length.total_seconds() - hours * 3600) > 1:
+                rounded_note = (
+                    f"Bans are stored in whole hours, so `{duration}` was rounded "
+                    f"to **{hours}h**."
+                )
+
+        already_banned = None
         try:
+            already_banned = await supa_admin.fetch_ban(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
             row = await supa_admin.ban_player(
                 client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
                 uid, reason, ban_length,
             )
         except supa_admin.SupaError as error:
-            if error.status == 409:
+            # banned_players.user_id is a foreign key into auth.users, so a UUID
+            # that isn't a real account fails here rather than on validation.
+            if "foreign key" in error.detail.lower() or "23503" in error.detail:
                 await interaction.followup.send(
-                    f"`{uid}` is already banned — `/unban` them first to change the ban."
+                    f"No player account exists with the ID `{uid}` — double-check the UUID."
                 )
             else:
                 await interaction.followup.send(str(error))
             return
-        embed = discord.Embed(title="🔨 Player banned", color=EMBED_RED)
+
+        row = row or {}
+        embed = discord.Embed(
+            title="🔨 Ban updated" if already_banned else "🔨 Player banned",
+            color=EMBED_RED,
+        )
         embed.add_field(name="Player", value=f"`{uid}`", inline=False)
-        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.add_field(name="Reason", value=row.get("reason") or reason, inline=False)
         if row.get("banned_until") and not row.get("is_permanent"):
             unix = int(
                 datetime.fromisoformat(
@@ -374,7 +402,9 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             embed.add_field(name="Until", value=f"<t:{unix}:f> (<t:{unix}:R>)", inline=False)
         else:
             embed.add_field(name="Until", value="Permanent", inline=False)
-        await interaction.followup.send(embed=embed)
+        if already_banned:
+            embed.set_footer(text="They were already banned — this replaced the old ban.")
+        await interaction.followup.send(embed=embed, content=rounded_note)
 
     @tree.command(name="unban", description="Unban a player by their user UUID.")
     @app_commands.describe(user_id="Player's user UUID")
@@ -761,6 +791,99 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             color=EMBED_COLOR,
         )
         await interaction.followup.send(embed=embed)
+
+    @tree.command(
+        name="ticket-panel",
+        description="Post the support panel players use to open tickets.",
+    )
+    @app_commands.describe(
+        channel="Where to post it (blank = right here)",
+    )
+    @app_commands.guild_only()
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def ticket_panel_command(
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        target = channel or interaction.channel
+        if not isinstance(target, discord.TextChannel):
+            await interaction.followup.send("Pick a normal text channel for the panel.")
+            return
+
+        permissions = target.permissions_for(interaction.guild.me)
+        if not (permissions.send_messages and permissions.embed_links):
+            await interaction.followup.send(
+                f"I can't post in {target.mention} — I need **Send Messages** and "
+                "**Embed Links** there."
+            )
+            return
+
+        await target.send(embed=tickets.panel_embed(), view=tickets.TicketPanelView())
+
+        notes = []
+        if not interaction.guild.me.guild_permissions.manage_channels:
+            notes.append(
+                "⚠️ I don't have **Manage Channels**, so ban-appeal and other "
+                "tickets can't open a channel until that's granted."
+            )
+        if discord.utils.get(interaction.guild.roles, name=STAFF_ROLE_NAME) is None:
+            notes.append(
+                f"⚠️ No **{STAFF_ROLE_NAME}** role exists, so nobody will be pinged "
+                "in new tickets and staff won't be added to them."
+            )
+        if not SUPABASE_SERVICE_ROLE_KEY:
+            notes.append(
+                "⚠️ `SUPABASE_SERVICE_ROLE_KEY` isn't set, so the cosmetics claim "
+                "will refuse to hand out codes."
+            )
+        await interaction.followup.send(
+            f"Panel posted in {target.mention}."
+            + ("\n\n" + "\n".join(notes) if notes else "")
+        )
+
+    @tree.command(
+        name="reset-cosmetic-claim",
+        description="Let someone claim the Discord cosmetics again.",
+    )
+    @app_commands.describe(user="The member whose claim should be cleared")
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def reset_cosmetic_claim_command(
+        interaction: discord.Interaction, user: discord.User
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        discord_id = str(user.id)
+        try:
+            claim = await supa_admin.fetch_ticket_claim(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, discord_id
+            )
+            if claim is None:
+                await interaction.followup.send(
+                    f"{user.mention} hasn't claimed the Discord cosmetics yet.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            await supa_admin.release_ticket_claim(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, discord_id
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        old_code = claim.get("code")
+        await interaction.followup.send(
+            f"✅ Cleared {user.mention}'s cosmetics claim — they can claim again."
+            + (
+                f"\nTheir old code was `{old_code}`; it still works unless you "
+                f"run `/disable-code {old_code}`."
+                if old_code
+                else ""
+            ),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @tree.command(
         name="prune-unverified",
