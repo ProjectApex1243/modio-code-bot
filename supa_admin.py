@@ -8,8 +8,9 @@ client).
 """
 
 import json
+import math
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 
 BAN_PERMISSIONS_TABLE = "ban_permissions"
@@ -18,6 +19,7 @@ INVENTORY_TABLE = "user_inventory"
 LEADERBOARD_TABLE = "tag_leaderboard"
 TITLE_DATA_TABLE = "title_data"
 CODES_TABLE = "redemption_codes"
+TICKET_CLAIMS_TABLE = "discord_ticket_claims"
 
 # Reads are capped so one command never tries to render an unbounded table.
 LIST_FETCH_LIMIT = 200
@@ -143,63 +145,60 @@ async def list_ban_perms(session, supabase_url, key) -> list[dict]:
 # --- Bans --------------------------------------------------------------------
 
 
+def duration_to_hours(duration: timedelta | None) -> int:
+    """Converts a ban length into the whole hours the ban_player RPC expects.
+
+    The RPC treats <= 0 as permanent, so a sub-hour ban is rounded UP to one
+    hour rather than being silently turned into a permanent one.
+    """
+    if duration is None:
+        return 0
+    return max(1, math.ceil(duration.total_seconds() / 3600))
+
+
 async def ban_player(
     session, supabase_url, key,
     user_id: str,
     reason: str,
     duration: timedelta | None,
-) -> dict:
-    """INSERT INTO banned_players — permanent when duration is None, otherwise
-    banned_until = now() + duration. Raises SupaError(409) if already banned."""
-    body: dict[str, Any] = {
-        "user_id": user_id,
-        "reason": reason,
-        "is_permanent": duration is None,
-    }
-    if duration is not None:
-        body["banned_until"] = (datetime.now(timezone.utc) + duration).isoformat()
-    rows = await _rest(
-        session, "POST", supabase_url, key, BANNED_PLAYERS_TABLE,
-        json_body=body, representation=True,
+) -> dict | None:
+    """Bans a player through the `ban_player` RPC, the same path staff use.
+
+    The RPC upserts, so re-banning someone updates their existing ban instead
+    of failing, and it records who issued the ban. Returns the resulting
+    banned_players row.
+    """
+    await _rest(
+        session, "POST", supabase_url, key, "rpc/ban_player",
+        json_body={
+            "target_user_id": user_id,
+            "ban_reason": reason,
+            "ban_duration_hours": duration_to_hours(duration),
+        },
     )
-    return rows[0] if isinstance(rows, list) and rows else body
+    return await fetch_ban(session, supabase_url, key, user_id)
 
 
-async def is_banned(session, supabase_url, key, user_id: str) -> bool:
+async def fetch_ban(session, supabase_url, key, user_id: str) -> dict | None:
+    """The player's banned_players row, or None if they aren't banned."""
     rows = await _rest(
         session, "GET", supabase_url, key, BANNED_PLAYERS_TABLE,
-        params={"select": "user_id", "user_id": f"eq.{user_id}", "limit": "1"},
+        params={"select": "*", "user_id": f"eq.{user_id}", "limit": "1"},
     ) or []
-    return bool(rows)
+    return rows[0] if rows else None
 
 
 async def unban_player(session, supabase_url, key, user_id: str) -> bool:
-    """Unbans a player. Returns False if they weren't banned in the first place.
+    """Unbans a player through the `unban_player` RPC, the same path staff use.
 
-    Prefers the `unban_player` RPC, since that's the path staff use in the SQL
-    editor and it may do more than clear the row (audit trail, related state).
-    PostgREST needs the argument by name and the function's parameter name isn't
-    recorded anywhere in this repo, so the likely spellings are tried in turn;
-    if none of them resolve, this falls back to deleting the row directly.
+    Returns False if they weren't banned in the first place — the RPC reports
+    success either way, so that's checked up front.
     """
-    if not await is_banned(session, supabase_url, key, user_id):
+    if await fetch_ban(session, supabase_url, key, user_id) is None:
         return False
-
-    for param in ("p_user_id", "user_id", "p_uuid", "target_user_id"):
-        try:
-            await _rest(
-                session, "POST", supabase_url, key, "rpc/unban_player",
-                json_body={param: user_id},
-            )
-            return True
-        except SupaError as error:
-            # 404 = no such function, 400 = wrong argument name for it.
-            if error.status not in (400, 404):
-                raise
-
     await _rest(
-        session, "DELETE", supabase_url, key, BANNED_PLAYERS_TABLE,
-        params={"user_id": f"eq.{user_id}"},
+        session, "POST", supabase_url, key, "rpc/unban_player",
+        json_body={"target_user_id": user_id},
     )
     return True
 
@@ -341,6 +340,55 @@ async def fetch_leaderboard(session, supabase_url, key, limit: int) -> list[dict
 
 
 # --- Redemption codes --------------------------------------------------------
+
+
+async def fetch_ticket_claim(session, supabase_url, key, discord_id: str) -> dict | None:
+    """The user's cosmetics-ticket claim row, or None if they haven't claimed."""
+    rows = await _rest(
+        session, "GET", supabase_url, key, TICKET_CLAIMS_TABLE,
+        params={"select": "*", "discord_id": f"eq.{discord_id}", "limit": "1"},
+    ) or []
+    return rows[0] if rows else None
+
+
+async def stake_ticket_claim(
+    session, supabase_url, key, discord_id: str, discord_tag: str
+) -> bool:
+    """Reserves the one-per-user cosmetics claim, before any code is minted.
+
+    discord_id is the table's primary key, so two rapid clicks can't both get
+    through — the loser gets a duplicate-key 409 and is told they already
+    claimed. Returns False in that case.
+    """
+    try:
+        await _rest(
+            session, "POST", supabase_url, key, TICKET_CLAIMS_TABLE,
+            json_body={"discord_id": discord_id, "discord_tag": discord_tag},
+        )
+        return True
+    except SupaError as error:
+        if error.status == 409:
+            return False
+        raise
+
+
+async def attach_ticket_claim_code(
+    session, supabase_url, key, discord_id: str, code: str
+) -> None:
+    """Records which code the claim handed out, so it can be shown again later."""
+    await _rest(
+        session, "PATCH", supabase_url, key, TICKET_CLAIMS_TABLE,
+        params={"discord_id": f"eq.{discord_id}"}, json_body={"code": code},
+    )
+
+
+async def release_ticket_claim(session, supabase_url, key, discord_id: str) -> None:
+    """Undoes a staked claim when minting the code failed, so the user isn't
+    locked out of a reward they never received."""
+    await _rest(
+        session, "DELETE", supabase_url, key, TICKET_CLAIMS_TABLE,
+        params={"discord_id": f"eq.{discord_id}"},
+    )
 
 
 async def disable_code(session, supabase_url, key, code: str) -> bool:
