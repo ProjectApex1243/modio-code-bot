@@ -26,7 +26,7 @@ logger = logging.getLogger("room-bot")
 # Cosmetics handed out by the Discord-cosmetics option. These ids were checked
 # against the live title_data catalog — note the real id is "Discord Claim
 # thing", not "Discord Claim", which silently grants nothing.
-DEFAULT_COSMETIC_ITEMS = ["Discord Stick", "Discord Badge", ""]
+DEFAULT_COSMETIC_ITEMS = ["DiscordStick", "Discord Badge", "Discord Claim thing"]
 
 # Exactly what staff would type by hand:
 #   /create-code items:DiscordStick,Discord Badge,Discord Claim thing
@@ -54,18 +54,25 @@ EMBED_BLURPLE = 0x5865F2
 TOPIC_PREFIX = "Ticket"
 _TOPIC_RE = re.compile(rf"{TOPIC_PREFIX} • (?P<kind>[a-z]+) • (?P<user_id>\d+)")
 
+# Each kind can land in its own category. The env var wins if it is set, so a
+# category can be moved without a code change; default_category_id is the
+# built-in fallback, and TICKET_CATEGORY_ID still covers both kinds at once.
 TICKET_KINDS = {
     "appeal": {
         "label": "Ban appeal",
         "emoji": "⚖️",
         "channel_prefix": "appeal",
         "blurb": "Appeal a ban. A staff member will review it with you here.",
+        "category_env": "TICKET_CATEGORY_ID_APPEAL",
+        "default_category_id": 1470654959069696140,
     },
     "other": {
         "label": "Something else",
         "emoji": "💬",
         "channel_prefix": "help",
         "blurb": "Anything else — bugs, reports, questions.",
+        "category_env": "TICKET_CATEGORY_ID_OTHER",
+        "default_category_id": 1468743079371477093,
     },
 }
 
@@ -81,13 +88,38 @@ def _supabase_config() -> tuple[str | None, str | None]:
     return os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 
-def _ticket_category_id() -> int | None:
+def _category_id_for(kind: str) -> int | None:
+    """Which category a ticket of this kind belongs in.
+
+    Order: the kind's own env var, then the built-in default for that kind,
+    then the shared TICKET_CATEGORY_ID.
+
+    The per-kind default deliberately outranks TICKET_CATEGORY_ID. Ban appeals
+    are pinned to their own category, and a shared setting meant for general
+    tickets must not silently drag them somewhere else; overriding them takes
+    the explicit TICKET_CATEGORY_ID_APPEAL.
+    """
+    spec = TICKET_KINDS[kind]
+
+    raw = os.environ.get(spec["category_env"], "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning(
+                "%s is not a number: %r — ignoring it.", spec["category_env"], raw
+            )
+
+    if spec.get("default_category_id") is not None:
+        return spec["default_category_id"]
+
     raw = os.environ.get("TICKET_CATEGORY_ID", "").strip()
-    try:
-        return int(raw) if raw else None
-    except ValueError:
-        logger.warning("TICKET_CATEGORY_ID is not a number: %r — ignoring it.", raw)
-        return None
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("TICKET_CATEGORY_ID is not a number: %r — ignoring it.", raw)
+    return None
 
 
 def help_menu_embed() -> discord.Embed:
@@ -327,13 +359,17 @@ async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None
         return
 
     category = None
-    category_id = _ticket_category_id()
+    category_id = _category_id_for(kind)
     if category_id is not None:
         found = guild.get_channel(category_id)
         if isinstance(found, discord.CategoryChannel):
             category = found
         else:
-            logger.warning("TICKET_CATEGORY_ID %s is not a category.", category_id)
+            logger.warning(
+                "Category %s for %s tickets is missing or is not a category "
+                "(is the bot in that server, and can it see it?). Falling back.",
+                category_id, kind,
+            )
     if category is None and isinstance(interaction.channel, discord.TextChannel):
         # Fall back to wherever the panel lives, so tickets stay near it.
         category = interaction.channel.category
