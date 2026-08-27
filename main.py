@@ -104,6 +104,7 @@ class RoomBot(discord.Client):
             ", ".join(tickets.registered_custom_ids()),
             ", ".join(tickets.cosmetic_items()),
         )
+        await tickets.self_test(self.http_session)
 
         if DISCORD_GUILD_ID:
             guild = discord.Object(id=int(DISCORD_GUILD_ID))
