@@ -34,6 +34,11 @@ DEFAULT_COSMETIC_ITEMS = ["DiscordStick", "Discord Badge", "Discord Claim thing"
 CLAIM_CODE_MAX_USES = 1
 CLAIM_CODE_EXPIRY = timedelta(days=1)
 
+STAFF_REPLY_NOTICE = (
+    "A staff member will come to help you whenever they can — please be "
+    "patient. Leave any extra details here in the meantime."
+)
+
 REDEEM_INSTRUCTIONS = (
     "Now that you have your code, go in game and head to the **computer** in "
     "Stump (or anywhere else you find one). Go down to the **REDEEM** tab, "
@@ -423,19 +428,22 @@ async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None
                 "Tell us your **in-game name**, your **player UUID** if you know "
                 "it, and why you think the ban should be lifted."
                 if kind == "appeal"
-                else "Describe what you need help with and staff will pick it up."
+                else "Describe what you need help with."
             )
         ),
         color=EMBED_RED if kind == "appeal" else EMBED_BLURPLE,
         timestamp=datetime.now(timezone.utc),
     )
+    embed.add_field(name="What happens next", value=STAFF_REPLY_NOTICE, inline=False)
     embed.set_footer(text=f"Opened by {interaction.user} • {interaction.user.id}")
 
+    # Deliberately no role ping: staff already see the channel through the
+    # overwrite above, and the embed tells the player someone will come.
+    # Mentions are suppressed so nothing in here can notify anyone.
     await channel.send(
-        content=staff_role.mention if staff_role else None,
         embed=embed,
         view=TicketCloseView(),
-        allowed_mentions=discord.AllowedMentions(roles=True, users=False),
+        allowed_mentions=discord.AllowedMentions.none(),
     )
     await interaction.followup.send(
         f"Opened your ticket: {channel.mention}", ephemeral=True
