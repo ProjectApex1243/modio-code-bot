@@ -26,7 +26,7 @@ logger = logging.getLogger("room-bot")
 # Cosmetics handed out by the Discord-cosmetics option. These ids were checked
 # against the live title_data catalog — note the real id is "Discord Claim
 # thing", not "Discord Claim", which silently grants nothing.
-DEFAULT_COSMETIC_ITEMS = ["DiscordStick", "Discord Badge", "Discord Claim thing"]
+DEFAULT_COSMETIC_ITEMS = ["Discord Stick", "Discord Badge", ""]
 
 # Exactly what staff would type by hand:
 #   /create-code items:DiscordStick,Discord Badge,Discord Claim thing
