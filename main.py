@@ -99,6 +99,11 @@ class RoomBot(discord.Client):
         # Must happen before the gateway connects, or ticket buttons posted
         # before the last restart come back dead.
         tickets.register_persistent_views(self)
+        logger.info(
+            "Ticket buttons registered (%s). Reward items: %s",
+            ", ".join(tickets.registered_custom_ids()),
+            ", ".join(tickets.cosmetic_items()),
+        )
 
         if DISCORD_GUILD_ID:
             guild = discord.Object(id=int(DISCORD_GUILD_ID))
