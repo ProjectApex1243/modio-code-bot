@@ -59,6 +59,13 @@ def _load_catalog() -> list[dict]:
 
 COSMETICS = _load_catalog()
 
+_NAME_BY_ID = {item["item_id"]: item["display_name"] for item in COSMETICS}
+
+
+def display_name_for(item_id: str) -> str | None:
+    """Display name for an exact item id, or None if it isn't in the catalog."""
+    return _NAME_BY_ID.get(item_id)
+
 
 def image_path(item: dict) -> Path | None:
     """Local sprite file for an item, or None if it has no usable icon."""
