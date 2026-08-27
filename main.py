@@ -18,7 +18,8 @@ from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
-from cosmetics import image_path, search_cosmetics
+import supa_admin
+from cosmetics import COSMETICS, display_name_for, image_path, search_cosmetics
 from redeem_codes import (
     create_code,
     generate_code,
@@ -51,8 +52,11 @@ UNVERIFIED_ROLE_NAME = "Unverified"
 # Seconds between kicks. Discord's per-guild kick bucket is tight; a small gap
 # keeps a large prune from stalling on 429s.
 PRUNE_KICK_DELAY = 1.0
-# How long the confirmation buttons stay clickable.
-PRUNE_CONFIRM_TIMEOUT = 120
+# How long confirmation buttons stay clickable.
+CONFIRM_TIMEOUT = 120
+# /leaderboard default and cap (the manual SQL used LIMIT 50).
+LEADERBOARD_DEFAULT = 10
+LEADERBOARD_MAX = 50
 EMBED_RED = 0xED4245
 # Sea green of the in-game cosmetic card header, so /lookup matches the store UI.
 EMBED_COSMETIC = 0x4E8877
@@ -107,14 +111,20 @@ class RoomBot(discord.Client):
         await super().close()
 
 
-class PruneConfirmView(discord.ui.View):
-    """Yes/no buttons shown before a prune actually kicks anyone. Only the member
+class ConfirmView(discord.ui.View):
+    """Yes/no buttons shown before a destructive action runs. Only the member
     who ran the command can press them."""
 
-    def __init__(self, invoker_id: int) -> None:
-        super().__init__(timeout=PRUNE_CONFIRM_TIMEOUT)
+    def __init__(self, invoker_id: int, confirm_label: str, working_text: str) -> None:
+        super().__init__(timeout=CONFIRM_TIMEOUT)
         self.invoker_id = invoker_id
         self.confirmed = False
+        self.working_text = working_text
+        # The decorator below needs a literal label, so the caller's wording is
+        # applied to the built button here.
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.style == discord.ButtonStyle.danger:
+                child.label = confirm_label
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
@@ -124,12 +134,14 @@ class PruneConfirmView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Kick them", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         self.confirmed = True
-        await interaction.response.edit_message(content="Kicking…", embed=None, view=None)
+        await interaction.response.edit_message(
+            content=self.working_text, embed=None, view=None
+        )
         self.stop()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -285,6 +297,472 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(embed=embed)
 
     @tree.command(
+        name="disable-code",
+        description="Kill a redemption code instantly (sets enabled = false).",
+    )
+    @app_commands.describe(code="The code to disable, e.g. APEX2026")
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def disable_code_command(interaction: discord.Interaction, code: str) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        cleaned = code.strip().upper()
+        if not cleaned:
+            await interaction.followup.send("Give me a code to disable.")
+            return
+        try:
+            found = await supa_admin.disable_code(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, cleaned
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        if found:
+            await interaction.followup.send(f"🚫 Code `{cleaned}` is now disabled.")
+        else:
+            await interaction.followup.send(f"No code named `{cleaned}` exists.")
+
+    @tree.command(
+        name="ban",
+        description="Ban a player by UUID — permanent, or timed if you give a duration.",
+    )
+    @app_commands.describe(
+        user_id="Player's user UUID",
+        reason="Why they're banned",
+        duration="Ban length, e.g. 24h, 7d, 1w (blank = permanent)",
+    )
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def ban_command(
+        interaction: discord.Interaction,
+        user_id: str,
+        reason: str,
+        duration: str | None = None,
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            ban_length = parse_duration(duration) if duration else None
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+        try:
+            row = await supa_admin.ban_player(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                uid, reason, ban_length,
+            )
+        except supa_admin.SupaError as error:
+            if error.status == 409:
+                await interaction.followup.send(
+                    f"`{uid}` is already banned — `/unban` them first to change the ban."
+                )
+            else:
+                await interaction.followup.send(str(error))
+            return
+        embed = discord.Embed(title="🔨 Player banned", color=EMBED_RED)
+        embed.add_field(name="Player", value=f"`{uid}`", inline=False)
+        embed.add_field(name="Reason", value=reason, inline=False)
+        if row.get("banned_until") and not row.get("is_permanent"):
+            unix = int(
+                datetime.fromisoformat(
+                    str(row["banned_until"]).replace("Z", "+00:00")
+                ).timestamp()
+            )
+            embed.add_field(name="Until", value=f"<t:{unix}:f> (<t:{unix}:R>)", inline=False)
+        else:
+            embed.add_field(name="Until", value="Permanent", inline=False)
+        await interaction.followup.send(embed=embed)
+
+    @tree.command(name="unban", description="Unban a player by their user UUID.")
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def unban_command(interaction: discord.Interaction, user_id: str) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            was_banned = await supa_admin.unban_player(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except (ValueError, supa_admin.SupaError) as error:
+            await interaction.followup.send(str(error))
+            return
+        if was_banned:
+            await interaction.followup.send(f"✅ Unbanned `{uid}`.")
+        else:
+            await interaction.followup.send(f"`{uid}` wasn't banned.")
+
+    @tree.command(name="banned-list", description="Show every banned player.")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def banned_list_command(interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            rows = await supa_admin.list_banned(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        if not rows:
+            await interaction.followup.send("Nobody is banned right now. 🎉")
+            return
+        embed = discord.Embed(
+            title=f"🔨 Banned players ({len(rows)})",
+            description=_joined_lines([_format_ban(row) for row in rows]),
+            color=EMBED_RED,
+        )
+        await interaction.followup.send(embed=embed)
+
+    @tree.command(
+        name="give-ban-perms",
+        description="Give a player in-game ban permissions.",
+    )
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def give_ban_perms_command(interaction: discord.Interaction, user_id: str) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            added = await supa_admin.give_ban_perms(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except (ValueError, supa_admin.SupaError) as error:
+            await interaction.followup.send(str(error))
+            return
+        if added:
+            await interaction.followup.send(f"✅ `{uid}` now has ban permissions.")
+        else:
+            await interaction.followup.send(f"`{uid}` already has ban permissions.")
+
+    @tree.command(
+        name="remove-ban-perms",
+        description="Take a player's in-game ban permissions away.",
+    )
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def remove_ban_perms_command(
+        interaction: discord.Interaction, user_id: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            removed = await supa_admin.remove_ban_perms(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except (ValueError, supa_admin.SupaError) as error:
+            await interaction.followup.send(str(error))
+            return
+        if removed:
+            await interaction.followup.send(f"✅ Removed ban permissions from `{uid}`.")
+        else:
+            await interaction.followup.send(f"`{uid}` didn't have ban permissions.")
+
+    @tree.command(
+        name="ban-perms-list",
+        description="Show every player with in-game ban permissions.",
+    )
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def ban_perms_list_command(interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            rows = await supa_admin.list_ban_perms(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        if not rows:
+            await interaction.followup.send("No players have ban permissions.")
+            return
+        embed = discord.Embed(
+            title=f"🛡️ Players with ban perms ({len(rows)})",
+            description=_joined_lines(
+                [f"`{row.get('user_id', '?')}`" for row in rows]
+            ),
+            color=EMBED_COLOR,
+        )
+        await interaction.followup.send(embed=embed)
+
+    @tree.command(
+        name="give-cosmetic",
+        description="Give a player one or more cosmetics.",
+    )
+    @app_commands.describe(
+        user_id="Player's user UUID",
+        items="Cosmetics to grant, comma-separated item IDs or names (use /lookup to find them)",
+    )
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def give_cosmetic_command(
+        interaction: discord.Interaction, user_id: str, items: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            item_ids, unknown = resolve_items(items)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+        try:
+            granted, already = await supa_admin.grant_items(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid, item_ids
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        parts = []
+        if granted:
+            parts.append(
+                f"✅ Gave `{uid}`: " + ", ".join(_item_label(i) for i in granted)
+            )
+        if already:
+            parts.append(
+                "Already owned (skipped): " + ", ".join(_item_label(i) for i in already)
+            )
+        if unknown:
+            parts.append(
+                "⚠️ Not in cosmetics.json, stored as typed: "
+                + ", ".join(f"`{token}`" for token in unknown)
+            )
+        await interaction.followup.send("\n".join(parts))
+
+    @tree.command(
+        name="remove-cosmetic",
+        description="Take one or more cosmetics away from a player.",
+    )
+    @app_commands.describe(
+        user_id="Player's user UUID",
+        items="Cosmetics to remove, comma-separated item IDs or names",
+    )
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def remove_cosmetic_command(
+        interaction: discord.Interaction, user_id: str, items: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            item_ids, _unknown = resolve_items(items)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+        try:
+            removed, not_owned = await supa_admin.remove_items(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid, item_ids
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        parts = []
+        if removed:
+            parts.append(
+                f"🗑️ Removed from `{uid}`: " + ", ".join(_item_label(i) for i in removed)
+            )
+        if not_owned:
+            parts.append(
+                "They didn't own: " + ", ".join(_item_label(i) for i in not_owned)
+            )
+        await interaction.followup.send("\n".join(parts))
+
+    @tree.command(
+        name="give-all-cosmetics",
+        description="Give a player every cosmetic in the game catalog.",
+    )
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def give_all_cosmetics_command(
+        interaction: discord.Interaction, user_id: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+        try:
+            catalog = await supa_admin.fetch_catalog_item_ids(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+            )
+            if not catalog:
+                await interaction.followup.send(
+                    "Couldn't read the game catalog from `title_data` — no items granted."
+                )
+                return
+            granted, already = await supa_admin.grant_items(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid, catalog
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        await interaction.followup.send(
+            f"🎁 Gave `{uid}` **{len(granted)}** new cosmetic(s) "
+            f"({len(already)} already owned) out of {len(catalog)} in the catalog."
+        )
+
+    @tree.command(
+        name="clear-inventory",
+        description="Delete a player's ENTIRE cosmetic inventory.",
+    )
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def clear_inventory_command(
+        interaction: discord.Interaction, user_id: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            owned = await supa_admin.fetch_inventory(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except (ValueError, supa_admin.SupaError) as error:
+            await interaction.followup.send(str(error))
+            return
+        if not owned:
+            await interaction.followup.send(f"`{uid}`'s inventory is already empty.")
+            return
+
+        confirm_embed = discord.Embed(
+            title="⚠️ Confirm inventory wipe",
+            description=(
+                f"This will delete **all {len(owned)}** cosmetic(s) that `{uid}` owns. "
+                "This cannot be undone."
+            ),
+            color=EMBED_RED,
+        )
+        view = ConfirmView(interaction.user.id, "Wipe inventory", "Wiping…")
+        await interaction.followup.send(embed=confirm_embed, view=view)
+        if await view.wait():
+            await interaction.followup.send("Timed out — nothing was deleted.")
+            return
+        if not view.confirmed:
+            # ConfirmView already replaced the message with "Cancelled."
+            return
+        try:
+            deleted = await supa_admin.clear_inventory(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        await interaction.followup.send(
+            f"🗑️ Deleted `{uid}`'s inventory — {deleted} row(s) removed."
+        )
+
+    @tree.command(
+        name="inventory",
+        description="Show every cosmetic a player owns.",
+    )
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def inventory_command(interaction: discord.Interaction, user_id: str) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            owned = await supa_admin.fetch_inventory(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except (ValueError, supa_admin.SupaError) as error:
+            await interaction.followup.send(str(error))
+            return
+        if not owned:
+            await interaction.followup.send(f"`{uid}` owns no cosmetics.")
+            return
+        embed = discord.Embed(
+            title=f"🎒 Inventory ({len(owned)} items)",
+            description=_joined_lines([_item_label(item_id) for item_id in owned]),
+            color=EMBED_COSMETIC,
+        )
+        embed.set_footer(text=uid)
+        await interaction.followup.send(embed=embed)
+
+    @tree.command(
+        name="reset-score",
+        description="Reset a player's leaderboard tag count to 0.",
+    )
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def reset_score_command(interaction: discord.Interaction, user_id: str) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            found = await supa_admin.reset_score(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except (ValueError, supa_admin.SupaError) as error:
+            await interaction.followup.send(str(error))
+            return
+        if found:
+            await interaction.followup.send(f"🏷️ Reset `{uid}`'s tag count to 0.")
+        else:
+            await interaction.followup.send(f"`{uid}` has no leaderboard row.")
+
+    @tree.command(
+        name="leaderboard",
+        description="Show the top players by total tags.",
+    )
+    @app_commands.describe(top="How many players to show (default 10, max 50)")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def leaderboard_command(
+        interaction: discord.Interaction,
+        top: app_commands.Range[int, 1, LEADERBOARD_MAX] = LEADERBOARD_DEFAULT,
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            rows = await supa_admin.fetch_leaderboard(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, top
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        if not rows:
+            await interaction.followup.send("The leaderboard is empty.")
+            return
+        embed = discord.Embed(
+            title=f"🏆 Tag leaderboard — top {len(rows)}",
+            description=_joined_lines(
+                [_leaderboard_line(rank, row) for rank, row in enumerate(rows, start=1)]
+            ),
+            color=EMBED_COLOR,
+        )
+        await interaction.followup.send(embed=embed)
+
+    @tree.command(
         name="prune-unverified",
         description=f"Kick every member with the {UNVERIFIED_ROLE_NAME} role. Server owner only.",
     )
@@ -390,7 +868,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             ),
             color=EMBED_RED,
         )
-        view = PruneConfirmView(interaction.user.id)
+        view = ConfirmView(interaction.user.id, "Kick them", "Kicking…")
         await interaction.followup.send(embed=confirm_embed, view=view)
 
         if await view.wait():
@@ -436,6 +914,12 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             for m in search_cosmetics(current, limit=25)
         ]
 
+    # The items fields take a comma-separated list, so completion applies to the
+    # segment after the last comma and keeps everything already typed.
+    create_code_command.autocomplete("items")(_items_autocomplete)
+    give_cosmetic_command.autocomplete("items")(_items_autocomplete)
+    remove_cosmetic_command.autocomplete("items")(_items_autocomplete)
+
     @tree.error
     async def on_app_command_error(
         interaction: discord.Interaction, error: app_commands.AppCommandError
@@ -458,6 +942,110 @@ def register_commands(tree: app_commands.CommandTree) -> None:
                 )
         except discord.NotFound:
             logger.warning("Interaction expired or unknown; could not send error reply.")
+
+
+async def _items_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Completes the cosmetic being typed after the last comma, leaving the
+    items already listed in front of it untouched."""
+    prefix, separator, tail = current.rpartition(",")
+    lead = f"{prefix}{separator} " if separator else ""
+
+    tail = tail.strip()
+    # Right after a comma there's nothing to search on yet, so show the top of
+    # the catalog rather than an empty "no options match" list.
+    matches = search_cosmetics(tail, limit=25) if tail else COSMETICS[:25]
+
+    choices: list[app_commands.Choice[str]] = []
+    for match in matches:
+        value = f"{lead}{match['display_name']}"
+        # Discord rejects a choice value over 100 chars, so drop suggestions
+        # that would overflow rather than sending a truncated item list.
+        if len(value) > 100:
+            continue
+        choices.append(app_commands.Choice(name=value[:100], value=value))
+    return choices
+
+
+async def _ensure_service_key(interaction: discord.Interaction) -> bool:
+    """The supa admin tables are RLS-locked with no policies, so every admin
+    command needs the service role key; fail with a setup hint instead of a
+    Postgres permission error."""
+    if SUPABASE_SERVICE_ROLE_KEY:
+        return True
+    await interaction.followup.send(
+        "`SUPABASE_SERVICE_ROLE_KEY` is not set on the bot, so it can't touch "
+        "these tables. Add it to the environment and restart."
+    )
+    return False
+
+
+def _item_label(item_id: str) -> str:
+    """An item id plus its catalog display name when we know it."""
+    name = display_name_for(item_id)
+    return f"`{item_id}` ({name})" if name else f"`{item_id}`"
+
+
+def _joined_lines(lines: list[str], limit: int = 3900) -> str:
+    """Joins lines for an embed description, cutting off with '+N more' safely
+    under Discord's 4096-char description limit."""
+    shown: list[str] = []
+    used = 0
+    for index, line in enumerate(lines):
+        cost = len(line) + (1 if shown else 0)
+        if used + cost > limit:
+            shown.append(f"… +{len(lines) - index} more")
+            break
+        shown.append(line)
+        used += cost
+    return "\n".join(shown)
+
+
+def _format_ban(row: dict) -> str:
+    """One banned_players row as a single line: who, why, and for how long."""
+    user_id = row.get("user_id", "?")
+    reason = str(row.get("reason") or "no reason recorded").strip()
+    if row.get("is_permanent") or not row.get("banned_until"):
+        window = "permanent"
+    else:
+        try:
+            until = datetime.fromisoformat(str(row["banned_until"]).replace("Z", "+00:00"))
+            unix = int(until.timestamp())
+            if until <= datetime.now(timezone.utc):
+                window = f"expired <t:{unix}:R>"
+            else:
+                window = f"until <t:{unix}:f>"
+        except ValueError:
+            window = f"until {row['banned_until']}"
+    return f"`{user_id}` — {reason} ({window})"
+
+
+# tag_leaderboard rows come from the game client, so like friendpresence the
+# column names may drift; accept the spellings we might see.
+_LEADERBOARD_NAME_KEYS = (
+    "display_name", "displayName", "username", "user_name",
+    "player_name", "playerName", "nickname", "name",
+)
+_LEADERBOARD_ID_KEYS = ("player_id", "playerId", "user_id", "id")
+
+
+def _leaderboard_line(rank: int, row: dict) -> str:
+    badge = RANK_BADGES[rank - 1] if rank <= len(RANK_BADGES) else f"`#{rank}`"
+    who = None
+    for key in _LEADERBOARD_NAME_KEYS:
+        value = row.get(key)
+        if value not in (None, ""):
+            who = f"**{_clean_room_name(str(value))}**"
+            break
+    if who is None:
+        for key in _LEADERBOARD_ID_KEYS:
+            value = row.get(key)
+            if value not in (None, ""):
+                who = f"`{value}`"
+                break
+    tags = row.get("total_tags") or 0
+    return f"{badge} {who or 'Unknown'} — {int(tags):,} tags"
 
 
 def _room_private_code(room: dict) -> str | None:
