@@ -28,9 +28,17 @@ logger = logging.getLogger("room-bot")
 # thing", not "Discord Claim", which silently grants nothing.
 DEFAULT_COSMETIC_ITEMS = ["DiscordStick", "Discord Badge", "Discord Claim thing"]
 
-# One redemption per code, since each is minted for a single named person.
+# Exactly what staff would type by hand:
+#   /create-code items:DiscordStick,Discord Badge,Discord Claim thing
+#                duration:1d max_uses:1
 CLAIM_CODE_MAX_USES = 1
-CLAIM_CODE_EXPIRY = timedelta(days=30)
+CLAIM_CODE_EXPIRY = timedelta(days=1)
+
+REDEEM_INSTRUCTIONS = (
+    "Now that you have your code, go in game and head to the **computer** in "
+    "Stump (or anywhere else you find one). Go down to the **REDEEM** tab, "
+    "type your code in and hit enter — and you're good!"
+)
 # generate_code() draws from 36^8 possibilities, so a collision is vanishingly
 # rare — but it costs nothing to try again rather than fail the user's claim.
 CODE_MINT_ATTEMPTS = 5
@@ -149,18 +157,16 @@ async def _mint_code(session, supabase_url: str, key: str) -> str:
 def _claimed_code_embed(code: str, items: list[str], *, fresh: bool) -> discord.Embed:
     embed = discord.Embed(
         title="🎁 Your Discord cosmetics" if fresh else "🎁 You already claimed these",
-        description=(
-            "Redeem this on the **computer in-game** — open the **REDEEM** tab "
-            "and type it in."
-        ),
         color=EMBED_COLOR,
     )
+    # Code block so Discord shows a copy button next to the code.
     embed.add_field(name="Your code", value=f"```\n{code}\n```", inline=False)
+    embed.add_field(name="Instructions", value=REDEEM_INSTRUCTIONS, inline=False)
     embed.add_field(
-        name="Grants", value="\n".join(f"`{item}`" for item in items), inline=False
+        name="What you get", value="\n".join(f"`{item}`" for item in items), inline=False
     )
     embed.set_footer(
-        text="This code only works once and it's tied to you — don't share it."
+        text="Works once, and it's yours — don't share it. Expires in 24 hours."
     )
     return embed
 
@@ -187,13 +193,16 @@ async def handle_cosmetics_claim(interaction: discord.Interaction) -> None:
         staked = await supa_admin.stake_ticket_claim(
             session, supabase_url, key, discord_id, str(interaction.user)
         )
-    except Exception:
+    except Exception as error:
         # Not just SupaError: a network blip raises an aiohttp error, and either
         # way nothing has been staked yet, so retrying is safe.
         logger.exception("Could not stake a cosmetics claim for %s", discord_id)
+        # The reason goes in the reply too. It's ephemeral, so only the person
+        # who pressed sees it, and it saves a trip through the hosting logs.
         await interaction.followup.send(
             "Something went wrong reaching the database. Nothing was used up — "
-            "try again in a moment.",
+            "try again in a moment.\n\nIf it keeps happening, show staff this:\n"
+            f"```\n{describe_error(error)}\n```",
             ephemeral=True,
         )
         return
@@ -216,7 +225,12 @@ async def handle_cosmetics_claim(interaction: discord.Interaction) -> None:
                             str(existing["claimed_at"]).replace("Z", "+00:00")
                         ).timestamp()
                     )
-                    embed.description += f"\n\nClaimed <t:{when}:R>."
+                    # Codes only last a day, so say how old this one is — it may
+                    # well have expired already.
+                    embed.description = (
+                        f"You claimed these <t:{when}:R>. If the code no longer "
+                        "works, open a **Something else** ticket."
+                    )
                 except ValueError:
                     pass
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -549,6 +563,55 @@ def registered_custom_ids() -> list[str]:
         for child in view_cls().children
         if getattr(child, "custom_id", None)
     ]
+
+
+def describe_error(error: BaseException) -> str:
+    """A short, safe one-liner for an exception.
+
+    Never includes headers, so the service role key can't leak into a Discord
+    message or a log line.
+    """
+    detail = str(error).strip() or error.__class__.__name__
+    if len(detail) > 300:
+        detail = detail[:300] + "…"
+    return f"{error.__class__.__name__}: {detail}"
+
+
+async def self_test(session) -> None:
+    """Checks at startup that the claims table is actually reachable.
+
+    Without this the first failure anyone sees is a player pressing the button,
+    which is a bad place to discover the bot can't talk to Supabase.
+    """
+    supabase_url, key = _supabase_config()
+    if not supabase_url:
+        logger.error("TICKET SELF-TEST: SUPABASE_URL is not set.")
+        return
+    if not key:
+        logger.error(
+            "TICKET SELF-TEST: SUPABASE_SERVICE_ROLE_KEY is not set — the "
+            "cosmetics claim will refuse every press."
+        )
+        return
+    if not supabase_url.startswith(("http://", "https://")):
+        logger.error(
+            "TICKET SELF-TEST: SUPABASE_URL is %r, which has no http(s):// "
+            "scheme. Every request will fail before it is sent.", supabase_url
+        )
+        return
+    if session is None:
+        logger.error("TICKET SELF-TEST: the bot has no HTTP session.")
+        return
+
+    try:
+        await supa_admin.fetch_ticket_claim(session, supabase_url, key, "0")
+    except Exception as error:
+        logger.error(
+            "TICKET SELF-TEST FAILED against %s — the cosmetics claim will not "
+            "work: %s", supabase_url, describe_error(error)
+        )
+        return
+    logger.info("TICKET SELF-TEST OK: %s is reachable.", supabase_url)
 
 
 def register_persistent_views(client: discord.Client) -> None:
