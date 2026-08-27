@@ -835,8 +835,8 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             )
         if discord.utils.get(interaction.guild.roles, name=STAFF_ROLE_NAME) is None:
             notes.append(
-                f"⚠️ No **{STAFF_ROLE_NAME}** role exists, so nobody will be pinged "
-                "in new tickets and staff won't be added to them."
+                f"⚠️ No **{STAFF_ROLE_NAME}** role exists, so staff won't be "
+                "added to new tickets — only the person who opened one could see it."
             )
         if not SUPABASE_SERVICE_ROLE_KEY:
             notes.append(
