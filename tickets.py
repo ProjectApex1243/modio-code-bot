@@ -83,10 +83,18 @@ def _ticket_category_id() -> int | None:
 
 
 def help_menu_embed() -> discord.Embed:
-    """The 'what do you need help with?' screen behind the panel button."""
+    """The 'what do you need help with?' screen, shown on the panel itself.
+
+    The three options live directly on this message rather than behind a
+    second, ephemeral menu. That is deliberate: discord.py rewrites
+    timeout=None to 15 minutes for any view sent ephemerally, and when that
+    copy expires it deletes its custom_ids from the store's shared dispatch
+    table — which silently kills the buttons for everyone, permanently.
+    Buttons on this ordinary message never time out, so they never do that.
+    """
     embed = discord.Embed(
         title="What do you need help with?",
-        description="Pick the option that fits best.",
+        description="Pick the option that fits best. Only you will see the reply.",
         color=EMBED_BLURPLE,
     )
     embed.add_field(
@@ -111,15 +119,9 @@ def help_menu_embed() -> discord.Embed:
 
 
 def panel_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="🎫 Support",
-        description=(
-            "Need something? Press the button below and pick what you need "
-            "help with.\n\nOnly you can see what you pick."
-        ),
-        color=EMBED_BLURPLE,
-    )
-    return embed
+    """What /ticket-panel posts. Same screen as the help menu, since the
+    options sit on the panel itself."""
+    return help_menu_embed()
 
 
 # --- Discord cosmetics -------------------------------------------------------
@@ -185,10 +187,13 @@ async def handle_cosmetics_claim(interaction: discord.Interaction) -> None:
         staked = await supa_admin.stake_ticket_claim(
             session, supabase_url, key, discord_id, str(interaction.user)
         )
-    except supa_admin.SupaError:
+    except Exception:
+        # Not just SupaError: a network blip raises an aiohttp error, and either
+        # way nothing has been staked yet, so retrying is safe.
         logger.exception("Could not stake a cosmetics claim for %s", discord_id)
         await interaction.followup.send(
-            "Something went wrong reaching the database. Try again in a moment.",
+            "Something went wrong reaching the database. Nothing was used up — "
+            "try again in a moment.",
             ephemeral=True,
         )
         return
@@ -449,11 +454,45 @@ class ConfirmCloseView(discord.ui.View):
 # --- Persistent views --------------------------------------------------------
 
 
-class TicketTypeView(discord.ui.View):
-    """The three help options. Shown only to the person who pressed the panel."""
+class _TicketView(discord.ui.View):
+    """Shared base for the ticket views.
+
+    discord.py's default on_error only writes to the bot's console, so a button
+    that raises looks exactly like a button nobody wired up — the click just
+    appears to do nothing. Reporting it to the person who pressed it turns a
+    silent failure into something they can actually tell staff about.
+    """
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item,
+    ) -> None:
+        label = getattr(item, "custom_id", None) or type(item).__name__
+        logger.exception("Ticket button %s failed", label, exc_info=error)
+        message = (
+            "Something broke on our end and this didn't go through — nothing was "
+            "used up. Please tell a staff member."
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            logger.exception("Could not even report the failure for %s", label)
+
+
+class TicketPanelView(_TicketView):
+    """The support panel: all three options, always on, never expiring.
+
+    Every reply these produce is ephemeral, but the buttons themselves live on
+    an ordinary message so nothing ever removes them from the dispatch table.
+    """
 
     @discord.ui.button(
         label="Discord cosmetics", emoji="🎁",
@@ -483,29 +522,8 @@ class TicketTypeView(discord.ui.View):
         await open_staff_ticket(interaction, "other")
 
 
-class TicketPanelView(discord.ui.View):
-    """The always-on button that lives in the support channel."""
-
-    def __init__(self) -> None:
-        super().__init__(timeout=None)
-
-    @discord.ui.button(
-        label="Create a ticket", emoji="🎫",
-        style=discord.ButtonStyle.primary, custom_id="ticket:open",
-    )
-    async def open_panel(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        await interaction.response.send_message(
-            embed=help_menu_embed(), view=TicketTypeView(), ephemeral=True
-        )
-
-
-class TicketCloseView(discord.ui.View):
+class TicketCloseView(_TicketView):
     """Close button pinned to the top of every staff ticket channel."""
-
-    def __init__(self) -> None:
-        super().__init__(timeout=None)
 
     @discord.ui.button(
         label="Close ticket", emoji="🔒",
@@ -517,9 +535,24 @@ class TicketCloseView(discord.ui.View):
         await close_ticket(interaction)
 
 
+# Only views that live on ordinary (non-ephemeral) messages belong here. A view
+# sent ephemerally must never be registered persistently — see help_menu_embed.
+PERSISTENT_VIEWS = (TicketPanelView, TicketCloseView)
+
+
+def registered_custom_ids() -> list[str]:
+    """Every button id the bot answers to — logged at startup so a dead button
+    can be told apart from one that was never registered."""
+    return [
+        str(child.custom_id)
+        for view_cls in PERSISTENT_VIEWS
+        for child in view_cls().children
+        if getattr(child, "custom_id", None)
+    ]
+
+
 def register_persistent_views(client: discord.Client) -> None:
     """Re-attaches the ticket buttons after a restart. Without this, every
     button posted before the restart stops responding."""
-    client.add_view(TicketPanelView())
-    client.add_view(TicketTypeView())
-    client.add_view(TicketCloseView())
+    for view_cls in PERSISTENT_VIEWS:
+        client.add_view(view_cls())
