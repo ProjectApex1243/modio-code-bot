@@ -1,0 +1,525 @@
+"""Ticket system: one panel button that opens a three-option help menu.
+
+  • Discord cosmetics — fully automatic. Mints a personal single-use redemption
+    code and hands it over on the spot. Limited to one per Discord account,
+    forever, enforced by the primary key on discord_ticket_claims.
+  • Ban appeal      — opens a private channel and pings staff.
+  • Something else  — same, with a different label.
+
+Every button carries a fixed custom_id and every view is built with
+timeout=None, so the panel keeps working across bot restarts as long as
+register_persistent_views() runs at startup.
+"""
+
+import logging
+import os
+import re
+from datetime import datetime, timedelta, timezone
+
+import discord
+
+import supa_admin
+from redeem_codes import create_code, generate_code
+
+logger = logging.getLogger("room-bot")
+
+# Cosmetics handed out by the Discord-cosmetics option. These ids were checked
+# against the live title_data catalog — note the real id is "Discord Claim
+# thing", not "Discord Claim", which silently grants nothing.
+DEFAULT_COSMETIC_ITEMS = ["DiscordStick", "Discord Badge", "Discord Claim thing"]
+
+# One redemption per code, since each is minted for a single named person.
+CLAIM_CODE_MAX_USES = 1
+CLAIM_CODE_EXPIRY = timedelta(days=30)
+# generate_code() draws from 36^8 possibilities, so a collision is vanishingly
+# rare — but it costs nothing to try again rather than fail the user's claim.
+CODE_MINT_ATTEMPTS = 5
+
+# Same default and same env var as main.py, so the two can't drift apart.
+STAFF_ROLE_NAME = os.environ.get("STAFF_ROLE_NAME", "Staff")
+EMBED_COLOR = 0x57F287
+EMBED_RED = 0xED4245
+EMBED_BLURPLE = 0x5865F2
+
+# Ticket channels record who opened them in the channel topic, which is what
+# stops one person from opening five appeals in a row.
+TOPIC_PREFIX = "Ticket"
+_TOPIC_RE = re.compile(rf"{TOPIC_PREFIX} • (?P<kind>[a-z]+) • (?P<user_id>\d+)")
+
+TICKET_KINDS = {
+    "appeal": {
+        "label": "Ban appeal",
+        "emoji": "⚖️",
+        "channel_prefix": "appeal",
+        "blurb": "Appeal a ban. A staff member will review it with you here.",
+    },
+    "other": {
+        "label": "Something else",
+        "emoji": "💬",
+        "channel_prefix": "help",
+        "blurb": "Anything else — bugs, reports, questions.",
+    },
+}
+
+
+def cosmetic_items() -> list[str]:
+    """Reward items, overridable with TICKET_COSMETIC_ITEMS (comma-separated)."""
+    raw = os.environ.get("TICKET_COSMETIC_ITEMS", "")
+    items = [token.strip() for token in raw.split(",") if token.strip()]
+    return items or list(DEFAULT_COSMETIC_ITEMS)
+
+
+def _supabase_config() -> tuple[str | None, str | None]:
+    return os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def _ticket_category_id() -> int | None:
+    raw = os.environ.get("TICKET_CATEGORY_ID", "").strip()
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        logger.warning("TICKET_CATEGORY_ID is not a number: %r — ignoring it.", raw)
+        return None
+
+
+def help_menu_embed() -> discord.Embed:
+    """The 'what do you need help with?' screen behind the panel button."""
+    embed = discord.Embed(
+        title="What do you need help with?",
+        description="Pick the option that fits best.",
+        color=EMBED_BLURPLE,
+    )
+    embed.add_field(
+        name="🎁 Discord cosmetics",
+        value=(
+            "Get your free Discord cosmetics right now — no waiting.\n"
+            "**One per person, so it can only be claimed once.**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{TICKET_KINDS['appeal']['emoji']} {TICKET_KINDS['appeal']['label']}",
+        value=TICKET_KINDS["appeal"]["blurb"] + "\nOpens a private channel with staff.",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{TICKET_KINDS['other']['emoji']} {TICKET_KINDS['other']['label']}",
+        value=TICKET_KINDS["other"]["blurb"] + "\nOpens a private channel with staff.",
+        inline=False,
+    )
+    return embed
+
+
+def panel_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="🎫 Support",
+        description=(
+            "Need something? Press the button below and pick what you need "
+            "help with.\n\nOnly you can see what you pick."
+        ),
+        color=EMBED_BLURPLE,
+    )
+    return embed
+
+
+# --- Discord cosmetics -------------------------------------------------------
+
+
+async def _mint_code(session, supabase_url: str, key: str) -> str:
+    """Creates one unused single-use redemption code and returns it."""
+    last_error: Exception | None = None
+    for _attempt in range(CODE_MINT_ATTEMPTS):
+        code = generate_code()
+        try:
+            await create_code(
+                session, supabase_url, key, code, cosmetic_items(),
+                CLAIM_CODE_MAX_USES, CLAIM_CODE_EXPIRY,
+            )
+            return code
+        except RuntimeError as error:
+            # Only a collision with an existing code is worth retrying.
+            if "already exists" not in str(error):
+                raise
+            last_error = error
+    raise RuntimeError(f"Could not find an unused code: {last_error}")
+
+
+def _claimed_code_embed(code: str, items: list[str], *, fresh: bool) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎁 Your Discord cosmetics" if fresh else "🎁 You already claimed these",
+        description=(
+            "Redeem this on the **computer in-game** — open the **REDEEM** tab "
+            "and type it in."
+        ),
+        color=EMBED_COLOR,
+    )
+    embed.add_field(name="Your code", value=f"```\n{code}\n```", inline=False)
+    embed.add_field(
+        name="Grants", value="\n".join(f"`{item}`" for item in items), inline=False
+    )
+    embed.set_footer(
+        text="This code only works once and it's tied to you — don't share it."
+    )
+    return embed
+
+
+async def handle_cosmetics_claim(interaction: discord.Interaction) -> None:
+    """Mints and hands over the one-per-person cosmetics code."""
+    await interaction.response.defer(ephemeral=True)
+    supabase_url, key = _supabase_config()
+    if not (supabase_url and key):
+        await interaction.followup.send(
+            "The cosmetics claim isn't set up yet — the bot is missing its "
+            "Supabase service key. Ping a staff member.",
+            ephemeral=True,
+        )
+        return
+
+    session = interaction.client.http_session
+    discord_id = str(interaction.user.id)
+    items = cosmetic_items()
+
+    # Stake the claim before minting anything: the primary key makes this the
+    # atomic step, so a double-click can't produce two codes.
+    try:
+        staked = await supa_admin.stake_ticket_claim(
+            session, supabase_url, key, discord_id, str(interaction.user)
+        )
+    except supa_admin.SupaError:
+        logger.exception("Could not stake a cosmetics claim for %s", discord_id)
+        await interaction.followup.send(
+            "Something went wrong reaching the database. Try again in a moment.",
+            ephemeral=True,
+        )
+        return
+
+    if not staked:
+        existing = None
+        try:
+            existing = await supa_admin.fetch_ticket_claim(
+                session, supabase_url, key, discord_id
+            )
+        except supa_admin.SupaError:
+            logger.exception("Could not read the existing claim for %s", discord_id)
+
+        if existing and existing.get("code"):
+            embed = _claimed_code_embed(existing["code"], items, fresh=False)
+            if existing.get("claimed_at"):
+                try:
+                    when = int(
+                        datetime.fromisoformat(
+                            str(existing["claimed_at"]).replace("Z", "+00:00")
+                        ).timestamp()
+                    )
+                    embed.description += f"\n\nClaimed <t:{when}:R>."
+                except ValueError:
+                    pass
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "You've already claimed the Discord cosmetics, so there's nothing "
+                "left to give. If you never got a code, open a **Something else** "
+                "ticket and staff can sort it out.",
+                ephemeral=True,
+            )
+        return
+
+    try:
+        code = await _mint_code(session, supabase_url, key)
+    except Exception:
+        logger.exception("Minting a cosmetics code failed for %s", discord_id)
+        # Hand the claim back so a database hiccup doesn't cost them the reward.
+        try:
+            await supa_admin.release_ticket_claim(session, supabase_url, key, discord_id)
+        except supa_admin.SupaError:
+            logger.exception("Could not release the staked claim for %s", discord_id)
+        await interaction.followup.send(
+            "Couldn't create your code just now — nothing was used up, so press "
+            "the button again in a moment.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await supa_admin.attach_ticket_claim_code(
+            session, supabase_url, key, discord_id, code
+        )
+    except supa_admin.SupaError:
+        # The code is already live and theirs; only our record of it is missing.
+        logger.exception("Could not record code %s against claim %s", code, discord_id)
+
+    await interaction.followup.send(
+        embed=_claimed_code_embed(code, items, fresh=True), ephemeral=True
+    )
+    logger.info("Issued cosmetics code %s to %s (%s)", code, interaction.user, discord_id)
+
+
+# --- Staff tickets -----------------------------------------------------------
+
+
+def _channel_topic(kind: str, user_id: int) -> str:
+    return f"{TOPIC_PREFIX} • {kind} • {user_id}"
+
+
+def find_open_ticket(
+    guild: discord.Guild, user_id: int, kind: str
+) -> discord.TextChannel | None:
+    """An existing open ticket of this kind for this user, if there is one."""
+    for channel in guild.text_channels:
+        match = _TOPIC_RE.search(channel.topic or "")
+        if match and match["kind"] == kind and int(match["user_id"]) == user_id:
+            return channel
+    return None
+
+
+def _channel_name(kind: str, user: discord.abc.User) -> str:
+    prefix = TICKET_KINDS[kind]["channel_prefix"]
+    # Discord lowercases names and replaces awkward characters anyway; doing it
+    # here keeps the result predictable instead of letting it mangle the name.
+    slug = re.sub(r"[^a-z0-9]+", "-", user.name.lower()).strip("-") or "player"
+    return f"{prefix}-{slug}"[:100]
+
+
+async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None:
+    """Creates the private channel for a ban appeal or a general question."""
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    if guild is None:
+        await interaction.followup.send(
+            "Tickets only work inside the server.", ephemeral=True
+        )
+        return
+
+    existing = find_open_ticket(guild, interaction.user.id, kind)
+    if existing is not None:
+        await interaction.followup.send(
+            f"You already have a **{TICKET_KINDS[kind]['label']}** ticket open: "
+            f"{existing.mention}",
+            ephemeral=True,
+        )
+        return
+
+    if not guild.me.guild_permissions.manage_channels:
+        await interaction.followup.send(
+            "I can't open a ticket — I'm missing the **Manage Channels** "
+            "permission. Please tell a staff member.",
+            ephemeral=True,
+        )
+        return
+
+    category = None
+    category_id = _ticket_category_id()
+    if category_id is not None:
+        found = guild.get_channel(category_id)
+        if isinstance(found, discord.CategoryChannel):
+            category = found
+        else:
+            logger.warning("TICKET_CATEGORY_ID %s is not a category.", category_id)
+    if category is None and isinstance(interaction.channel, discord.TextChannel):
+        # Fall back to wherever the panel lives, so tickets stay near it.
+        category = interaction.channel.category
+
+    staff_role = discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True,
+            attach_files=True, read_message_history=True,
+        ),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True,
+            manage_channels=True, read_message_history=True,
+        ),
+    }
+    if staff_role is not None:
+        overwrites[staff_role] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True,
+            attach_files=True, read_message_history=True,
+        )
+
+    try:
+        channel = await guild.create_text_channel(
+            name=_channel_name(kind, interaction.user),
+            category=category,
+            overwrites=overwrites,
+            topic=_channel_topic(kind, interaction.user.id),
+            reason=f"{TICKET_KINDS[kind]['label']} ticket for {interaction.user}",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I'm not allowed to create a channel there. A staff member needs to "
+            "check my permissions on the ticket category.",
+            ephemeral=True,
+        )
+        return
+    except discord.HTTPException:
+        logger.exception("Creating a %s ticket failed for %s", kind, interaction.user)
+        await interaction.followup.send(
+            "Couldn't open your ticket just now. Try again in a moment.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"{TICKET_KINDS[kind]['emoji']} {TICKET_KINDS[kind]['label']}",
+        description=(
+            f"{interaction.user.mention} opened this ticket.\n\n"
+            + (
+                "Tell us your **in-game name**, your **player UUID** if you know "
+                "it, and why you think the ban should be lifted."
+                if kind == "appeal"
+                else "Describe what you need help with and staff will pick it up."
+            )
+        ),
+        color=EMBED_RED if kind == "appeal" else EMBED_BLURPLE,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_footer(text=f"Opened by {interaction.user} • {interaction.user.id}")
+
+    await channel.send(
+        content=staff_role.mention if staff_role else None,
+        embed=embed,
+        view=TicketCloseView(),
+        allowed_mentions=discord.AllowedMentions(roles=True, users=False),
+    )
+    await interaction.followup.send(
+        f"Opened your ticket: {channel.mention}", ephemeral=True
+    )
+    logger.info("Opened %s ticket %s for %s", kind, channel.id, interaction.user)
+
+
+async def close_ticket(interaction: discord.Interaction) -> None:
+    """Deletes the ticket channel, once the presser is allowed to close it."""
+    channel = interaction.channel
+    match = _TOPIC_RE.search(getattr(channel, "topic", "") or "")
+    if match is None:
+        await interaction.response.send_message(
+            "This doesn't look like a ticket channel.", ephemeral=True
+        )
+        return
+
+    opener_id = int(match["user_id"])
+    is_staff = any(role.name == STAFF_ROLE_NAME for role in getattr(interaction.user, "roles", []))
+    if interaction.user.id != opener_id and not is_staff:
+        await interaction.response.send_message(
+            "Only the person who opened this ticket or a staff member can close it.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "Close this ticket? The channel and everything in it will be deleted.",
+        view=ConfirmCloseView(interaction.user.id),
+        ephemeral=True,
+    )
+
+
+class ConfirmCloseView(discord.ui.View):
+    """Second step of closing, so a stray click doesn't delete the history."""
+
+    def __init__(self, invoker_id: int) -> None:
+        super().__init__(timeout=60)
+        self.invoker_id = invoker_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.invoker_id
+
+    @discord.ui.button(label="Delete it", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(content="Closing…", view=None)
+        try:
+            await interaction.channel.delete(
+                reason=f"Ticket closed by {interaction.user}"
+            )
+        except discord.HTTPException:
+            logger.exception("Could not delete ticket channel %s", interaction.channel)
+            await interaction.followup.send(
+                "I couldn't delete the channel — check my permissions.", ephemeral=True
+            )
+
+    @discord.ui.button(label="Keep it open", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.edit_message(content="Left open.", view=None)
+
+
+# --- Persistent views --------------------------------------------------------
+
+
+class TicketTypeView(discord.ui.View):
+    """The three help options. Shown only to the person who pressed the panel."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Discord cosmetics", emoji="🎁",
+        style=discord.ButtonStyle.success, custom_id="ticket:cosmetics",
+    )
+    async def cosmetics(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await handle_cosmetics_claim(interaction)
+
+    @discord.ui.button(
+        label="Ban appeal", emoji="⚖️",
+        style=discord.ButtonStyle.secondary, custom_id="ticket:appeal",
+    )
+    async def appeal(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await open_staff_ticket(interaction, "appeal")
+
+    @discord.ui.button(
+        label="Something else", emoji="💬",
+        style=discord.ButtonStyle.secondary, custom_id="ticket:other",
+    )
+    async def other(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await open_staff_ticket(interaction, "other")
+
+
+class TicketPanelView(discord.ui.View):
+    """The always-on button that lives in the support channel."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Create a ticket", emoji="🎫",
+        style=discord.ButtonStyle.primary, custom_id="ticket:open",
+    )
+    async def open_panel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_message(
+            embed=help_menu_embed(), view=TicketTypeView(), ephemeral=True
+        )
+
+
+class TicketCloseView(discord.ui.View):
+    """Close button pinned to the top of every staff ticket channel."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Close ticket", emoji="🔒",
+        style=discord.ButtonStyle.danger, custom_id="ticket:close",
+    )
+    async def close(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await close_ticket(interaction)
+
+
+def register_persistent_views(client: discord.Client) -> None:
+    """Re-attaches the ticket buttons after a restart. Without this, every
+    button posted before the restart stops responding."""
+    client.add_view(TicketPanelView())
+    client.add_view(TicketTypeView())
+    client.add_view(TicketCloseView())
