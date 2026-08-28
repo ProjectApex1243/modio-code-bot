@@ -7266,7 +7266,7 @@
 },
 {
 "id": "LHAIF.",
-"name": "LHAIF.",
+"name": "YELLOW SUNHAT",
 "category": "Hat",
 "cost": 2000,
 "image": "LHAIF.png"
@@ -12799,49 +12799,49 @@
 "name": "ALIEN EYE STALK HAT",
 "category": "Hat",
 "cost": 2200,
-"image": ""
+"image": "LHANZ.png"
 },
 {
 "id": "LMBAT.",
 "name": "ALIEN SPECIMEN CANISTER",
 "category": "Arms",
 "cost": 3500,
-"image": ""
+"image": "LMBAT.png"
 },
 {
 "id": "LBAUC.",
 "name": "BADGE U F O",
 "category": "Badge",
 "cost": 0,
-"image": ""
+"image": "LBAUC.png"
 },
 {
 "id": "LMAZM.",
 "name": "DIGICAL VMT PLUSH",
 "category": "Arms",
 "cost": 0,
-"image": ""
+"image": "LMAZM.png"
 },
 {
 "id": "LMBAR.",
 "name": "FLOPPY TENTACLE FINGERS",
 "category": "Paw",
 "cost": 2300,
-"image": ""
+"image": "LMBAR.png"
 },
 {
 "id": "LBAUA.",
 "name": "FLYING SAUCER PANTS",
 "category": "Pants",
 "cost": 2700,
-"image": ""
+"image": "LBAUA.png"
 },
 {
 "id": "LMBAQ.",
 "name": "GLOWING ALIEN FINGERS",
 "category": "Paw",
 "cost": 2500,
-"image": ""
+"image": "LMBAQ.png"
 },
 {
 "id": "LFAJX.",
@@ -12855,84 +12855,84 @@
 "name": "GREY ALIEN FUR",
 "category": "Fur",
 "cost": 3000,
-"image": ""
+"image": "LBAUB.png"
 },
 {
 "id": "LMBAF.",
 "name": "HOLDABLE V I M BANANA",
 "category": "Arms",
 "cost": 0,
-"image": ""
+"image": "LMBAF.png"
 },
 {
 "id": "LFAJY.",
 "name": "HUGGY FACE ALIEN",
 "category": "Face",
 "cost": 2100,
-"image": ""
+"image": "LFAJY.png"
 },
 {
 "id": "LMAXW.",
 "name": "MODEL ROCKET",
 "category": "Arms",
 "cost": 4400,
-"image": ""
+"image": "LMAXW.png"
 },
 {
 "id": "LMAZK.",
 "name": "PLUSHIE MOTHMAN V2",
 "category": "Back",
 "cost": 3400,
-"image": ""
+"image": "LMAZK.png"
 },
 {
 "id": "LMBAS.",
 "name": "RC FLYING SAUCER",
 "category": "Arms",
 "cost": 5000,
-"image": ""
+"image": "LMBAS.png"
 },
 {
 "id": "LBAUF.",
 "name": "RED DOT SHIRT",
 "category": "Shirt",
 "cost": 2000,
-"image": ""
+"image": "LBAUF.png"
 },
 {
 "id": "LBAUG.",
 "name": "U F O PATTERN HAWAIIAN SHIRT",
 "category": "Shirt",
 "cost": 2100,
-"image": ""
+"image": "LBAUG.png"
 },
 {
 "id": "LBATX.",
 "name": "V M T BAGGY JEAN LEGS",
 "category": "Pants",
 "cost": 2000,
-"image": ""
+"image": "LBATX.png"
 },
 {
 "id": "LBATW.",
 "name": "V M T DIAMOND BANANA APPLIQUE SHIRT",
 "category": "Shirt",
 "cost": 1500,
-"image": ""
+"image": "LBATW.png"
 },
 {
 "id": "LHANY.",
 "name": "V M T DIAMOND BANANA HAT",
 "category": "Hat",
 "cost": 1500,
-"image": ""
+"image": "LHANY.png"
 },
 {
 "id": "LBATY.",
 "name": "V M T VARSITY JACKET",
 "category": "Shirt",
 "cost": 1900,
-"image": ""
+"image": "LBATY.png"
 },
 {
 "id": "dbadge.",
@@ -13178,5 +13178,967 @@
 "category": "",
 "cost": 0,
 "image": ""
+},
+{
+"id": "LZAAA.",
+"name": "SHOWMEYOURFRIENDS",
+"category": "Collectable",
+"cost": 0,
+"image": "LZAAA.png"
+},
+{
+"id": "DONOB.",
+"name": "DONO BUNDLE BOOMBOX",
+"category": "Back",
+"cost": 0,
+"image": "DONOB.png"
+},
+{
+"id": "LZAAB.",
+"name": "APHEX TWIN",
+"category": "Collectable",
+"cost": 0,
+"image": "LZAAB.png"
+},
+{
+"id": "LZAAC.",
+"name": "FAREXPULLMYPEARL",
+"category": "Collectable",
+"cost": 0,
+"image": "LZAAC.png"
+},
+{
+"id": "LZAAD.",
+"name": "TERRANOVA",
+"category": "Collectable",
+"cost": 0,
+"image": "LZAAD.png"
+},
+{
+"id": "LZAAE.",
+"name": "HOMER LET THE BARTS OUT",
+"category": "Collectable",
+"cost": 0,
+"image": "LZAAE.png"
+},
+{
+"id": "LZAAF.",
+"name": "LEGACY",
+"category": "Collectable",
+"cost": 0,
+"image": "LZAAF.png"
+},
+{
+"id": "LZAAG.",
+"name": "COOLGREENSHIRT",
+"category": "Shirt",
+"cost": 0,
+"image": "LZAAG.png"
+},
+{
+"id": "LZAAH.",
+"name": "COOLGREENHAT",
+"category": "Hat",
+"cost": 0,
+"image": "LZAAH.png"
+},
+{
+"id": "LJOGD.",
+"name": "DONODJ PACK",
+"category": "Set",
+"cost": 0,
+"image": "LJOGD.png"
+},
+{
+"id": "LZHZI.",
+"name": "BLACKCOWBOYHAT",
+"category": "Hat",
+"cost": 0,
+"image": "LZHZI.png"
+},
+{
+"id": "GOLDENHAT",
+"name": "GOLDENHAT",
+"category": "Hat",
+"cost": 1,
+"image": "GOLDENHAT.png"
+},
+{
+"id": "LBASX.",
+"name": "GSP BADGE",
+"category": "Badge",
+"cost": 1,
+"image": "LBASX.png"
+},
+{
+"id": "LBATL.",
+"name": "SCI FI SPACE SUIT",
+"category": "Shirt",
+"cost": 1,
+"image": "LBATL.png"
+},
+{
+"id": "LBATM.",
+"name": "SHIRT SPACE SUIT MERC",
+"category": "Shirt",
+"cost": 1,
+"image": "LBATM.png"
+},
+{
+"id": "LBATN.",
+"name": "G S P SPACESUIT SHIRT",
+"category": "Shirt",
+"cost": 1,
+"image": "LBATN.png"
+},
+{
+"id": "LBATP.",
+"name": "SHIRT WRONG STUFF",
+"category": "Shirt",
+"cost": 1,
+"image": "LBATP.png"
+},
+{
+"id": "LBATQ.",
+"name": "G S P LOGO TEE",
+"category": "Shirt",
+"cost": 1,
+"image": "LBATQ.png"
+},
+{
+"id": "LBAUI.",
+"name": "BASEBALL JERSEY MONKES",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUI.png"
+},
+{
+"id": "LBAUJ.",
+"name": "BASEBALL JERSEY COKUHNUZ",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUJ.png"
+},
+{
+"id": "LBAUK.",
+"name": "BASEBALL JERSEY DOUGS",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUK.png"
+},
+{
+"id": "LBAUL.",
+"name": "BASEBALL JERSEY BANANNANNANAS",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUL.png"
+},
+{
+"id": "LBAUM.",
+"name": "CATCHERS CHEST PROTECTOR",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUM.png"
+},
+{
+"id": "LBAUN.",
+"name": "BADGE BASEBALL",
+"category": "Badge",
+"cost": 1,
+"image": "LBAUN.png"
+},
+{
+"id": "LBAUP.",
+"name": "BANANA BEARD COAT",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUP.png"
+},
+{
+"id": "LBAUQ.",
+"name": "STRIPED PIRATE SHIRT",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUQ.png"
+},
+{
+"id": "LBAUR.",
+"name": "PIRATE VEST",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUR.png"
+},
+{
+"id": "LBAUS.",
+"name": "FAT BELLY PIRATE VEST",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUS.png"
+},
+{
+"id": "LBAUT.",
+"name": "DOUBLE PEG LEGS PIRATE SHORTS",
+"category": "Pants",
+"cost": 1,
+"image": "LBAUT.png"
+},
+{
+"id": "LBAUU.",
+"name": "BADGE TREASURE CHEST",
+"category": "Badge",
+"cost": 1,
+"image": "LBAUU.png"
+},
+{
+"id": "LBAUW.",
+"name": "BANANA BEARD CURSED FUR",
+"category": "Fur",
+"cost": 1,
+"image": "LBAUW.png"
+},
+{
+"id": "LEAAH.",
+"name": "BLACKHOLE EXPLOSION TAG EFFECT",
+"category": "TagEffect",
+"cost": 1,
+"image": "LEAAH.png"
+},
+{
+"id": "LFAJZ.",
+"name": "CATCHERS MASK",
+"category": "Face",
+"cost": 1,
+"image": "LFAJZ.png"
+},
+{
+"id": "LFAKA.",
+"name": "BANANA BEARD FACE",
+"category": "Face",
+"cost": 1,
+"image": "LFAKA.png"
+},
+{
+"id": "LFAKB.",
+"name": "BUSHY MUTTON CHOPS",
+"category": "Face",
+"cost": 1,
+"image": "LFAKB.png"
+},
+{
+"id": "LFAKC.",
+"name": "SKULL AND CROSSBONES EYEPATCH",
+"category": "Face",
+"cost": 1,
+"image": "LFAKC.png"
+},
+{
+"id": "LFAKD.",
+"name": "BARTENDER CHOPS",
+"category": "Face",
+"cost": 1,
+"image": "LFAKD.png"
+},
+{
+"id": "LHANN.",
+"name": "SCI FI SPACESUIT HELMET",
+"category": "Hat",
+"cost": 1,
+"image": "LHANN.png"
+},
+{
+"id": "LHANO.",
+"name": "HAT SPACE HELMET MERC",
+"category": "Hat",
+"cost": 1,
+"image": "LHANO.png"
+},
+{
+"id": "LHANP.",
+"name": "G S P SPACESUIT HELMET",
+"category": "Hat",
+"cost": 1,
+"image": "LHANP.png"
+},
+{
+"id": "LHANQ.",
+"name": "A A C PARTY HAT",
+"category": "Hat",
+"cost": 1,
+"image": "LHANQ.png"
+},
+{
+"id": "LHANR.",
+"name": "G S P LOGO BALLCAP",
+"category": "Hat",
+"cost": 1,
+"image": "LHANR.png"
+},
+{
+"id": "LHANS.",
+"name": "ROCKETMONKE HELMET",
+"category": "Hat",
+"cost": 1,
+"image": "LHANS.png"
+},
+{
+"id": "LHAOB.",
+"name": "BASEBALL REVERSIBLE BALLCAP V1",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOB.png"
+},
+{
+"id": "LHAOC.",
+"name": "BASEBALL REVERSIBLE BALLCAP V2",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOC.png"
+},
+{
+"id": "LHAOD.",
+"name": "BASEBALL REVERSIBLE BALLCAP V3",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOD.png"
+},
+{
+"id": "LHAOE.",
+"name": "BASEBALL REVERSIBLE BALLCAP V4",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOE.png"
+},
+{
+"id": "LHAOF.",
+"name": "ILLUMINATI ALL SEEING EYE",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOF.png"
+},
+{
+"id": "LHAOG.",
+"name": "GOLD SPACESUIT HELMET",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOG.png"
+},
+{
+"id": "LHAOH.",
+"name": "BANANA BEARD HAT",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOH.png"
+},
+{
+"id": "LHAOI.",
+"name": "PIRATE BANDANA V2",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOI.png"
+},
+{
+"id": "LHAOJ.",
+"name": "TRICORN HAT V2",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOJ.png"
+},
+{
+"id": "LMAYI.",
+"name": "HOURGLASS",
+"category": "Arms",
+"cost": 1,
+"image": "LMAYI.png"
+},
+{
+"id": "LMAZS.",
+"name": "SCI FI SPACESUIT GLOVES",
+"category": "Paw",
+"cost": 1,
+"image": "LMAZS.png"
+},
+{
+"id": "LMAZT.",
+"name": "SCI FI LASER BLASTER",
+"category": "Arms",
+"cost": 1,
+"image": "LMAZT.png"
+},
+{
+"id": "LMAZU.",
+"name": "SCI FI JETPACK",
+"category": "Back",
+"cost": 1,
+"image": "LMAZU.png"
+},
+{
+"id": "LMAZV.",
+"name": "GLOVES SPACE MERC",
+"category": "Paw",
+"cost": 1,
+"image": "LMAZV.png"
+},
+{
+"id": "LMAZW.",
+"name": "G S P SPACESUIT GLOVES",
+"category": "Paw",
+"cost": 1,
+"image": "LMAZW.png"
+},
+{
+"id": "LMAZX.",
+"name": "PLACEABLE STRIKEZONE",
+"category": "Back",
+"cost": 1,
+"image": "LMAZX.png"
+},
+{
+"id": "LMAZY.",
+"name": "G S P WELDING TORCH",
+"category": "Arms",
+"cost": 1,
+"image": "LMAZY.png"
+},
+{
+"id": "LMAZZ.",
+"name": "G S P HAND DRILL",
+"category": "Arms",
+"cost": 1,
+"image": "LMAZZ.png"
+},
+{
+"id": "LMBAA.",
+"name": "HOLDABLE G S P SCREWDRIVER",
+"category": "Arms",
+"cost": 1,
+"image": "LMBAA.png"
+},
+{
+"id": "LMBAB.",
+"name": "ASTRONAUT ICE CREAM",
+"category": "Arms",
+"cost": 1,
+"image": "LMBAB.png"
+},
+{
+"id": "LMBAC.",
+"name": "ASTRONAUT DRINK POUCH",
+"category": "Arms",
+"cost": 1,
+"image": "LMBAC.png"
+},
+{
+"id": "LMBAD.",
+"name": "G S P SPACEWALK BACKPACK",
+"category": "Back",
+"cost": 1,
+"image": "LMBAD.png"
+},
+{
+"id": "LMBAE.",
+"name": "G S P EMESIS BAG",
+"category": "Arms",
+"cost": 1,
+"image": "LMBAE.png"
+},
+{
+"id": "LMBAU.",
+"name": "DIGICAL WINTER HAT",
+"category": "Back",
+"cost": 1,
+"image": "LMBAU.png"
+},
+{
+"id": "LMBAV.",
+"name": "DIGICAL LUNCHBOX",
+"category": "Back",
+"cost": 1,
+"image": "LMBAV.png"
+},
+{
+"id": "LMBAW.",
+"name": "DIGICAL ELLIOT PLUSH",
+"category": "Arms",
+"cost": 1,
+"image": "LMBAW.png"
+},
+{
+"id": "LMBAZ.",
+"name": "OVERSIZED BASEBALL BAT",
+"category": "Back",
+"cost": 1,
+"image": "LMBAZ.png"
+},
+{
+"id": "LMBBA.",
+"name": "BASEBALL MITT",
+"category": "Paw",
+"cost": 1,
+"image": "LMBBA.png"
+},
+{
+"id": "LMBBC.",
+"name": "STRIKEZONE BASEBALL PROJECTILE LEFT",
+"category": "Paw",
+"cost": 1,
+"image": ""
+},
+{
+"id": "LMBBD.",
+"name": "STRIKEZONE BASEBALL PROJECTILE RIGHT",
+"category": "Paw",
+"cost": 1,
+"image": ""
+},
+{
+"id": "LMBBE.",
+"name": "BANANA BEARD CURSED MEDALLION",
+"category": "Arms",
+"cost": 1,
+"image": "LMBBE.png"
+},
+{
+"id": "LMBBF.",
+"name": "BANANA BEARD CUTLASS",
+"category": "Back",
+"cost": 1,
+"image": "LMBBF.png"
+},
+{
+"id": "LMBBG.",
+"name": "BANANA BEARD BLUNDERBUSS",
+"category": "Arms",
+"cost": 1,
+"image": "LMBBG.png"
+},
+{
+"id": "LMBBH.",
+"name": "ANCHOR BALLOON",
+"category": "Back",
+"cost": 1,
+"image": "LMBBH.png"
+},
+{
+"id": "LMBBI.",
+"name": "DIGGING SHOVEL",
+"category": "Back",
+"cost": 1,
+"image": "LMBBI.png"
+},
+{
+"id": "LMBBJ.",
+"name": "ORNATE FENCING FOIL",
+"category": "Back",
+"cost": 1,
+"image": "LMBBJ.png"
+},
+{
+"id": "LMBBK.",
+"name": "SHIP IN A BOTTLE",
+"category": "Arms",
+"cost": 1,
+"image": "LMBBK.png"
+},
+{
+"id": "LMBBL.",
+"name": "CLAM SHELL OF PROTECTION",
+"category": "Arms",
+"cost": 1,
+"image": "LMBBL.png"
+},
+{
+"id": "LMBBM.",
+"name": "TREASURE HUNT EVENT SAND DOLLAR",
+"category": "Arms",
+"cost": 1,
+"image": "LMBBM.png"
+},
+{
+"id": "LPAAO.",
+"name": "MONKTOON COMIC 007",
+"category": "Collectable",
+"cost": 1,
+"image": "LPAAO.png"
+},
+{
+"id": "LPAAP.",
+"name": "MONKTOON COMIC 008",
+"category": "Collectable",
+"cost": 1,
+"image": "LPAAP.png"
+},
+{
+"id": "LPAAQ.",
+"name": "MONKTOON COMIC 009",
+"category": "Collectable",
+"cost": 1,
+"image": "LPAAQ.png"
+},
+{
+"id": "LPAAR.",
+"name": "MONKTOON COMIC 010",
+"category": "Collectable",
+"cost": 1,
+"image": "LPAAR.png"
+},
+{
+"id": "LPAAS.",
+"name": "MONKTOON COMIC 011",
+"category": "Collectable",
+"cost": 1,
+"image": "LPAAS.png"
+},
+{
+"id": "LPABC.",
+"name": "MONKTOON COMIC 014",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABC.png"
+},
+{
+"id": "LPABD.",
+"name": "CASSETTE TAPE_07",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABD.png"
+},
+{
+"id": "LPABE.",
+"name": "MONKTOON COMIC 015",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABE.png"
+},
+{
+"id": "LSAED.",
+"name": "ZIPP ZELMUT PACK",
+"category": "Set",
+"cost": 1,
+"image": "LSAED.png",
+"bundled": [
+"LHANN.",
+"LBATL.",
+"LMAZS.",
+"LMAZT."
+]
+},
+{
+"id": "LSAEE.",
+"name": "MERCURY SPACESUIT SET",
+"category": "Set",
+"cost": 1,
+"image": "LSAEE.png",
+"bundled": [
+"LBATM.",
+"LHANO.",
+"LMAZV."
+]
+},
+{
+"id": "LSAEF.",
+"name": "GSP SPACESUIT SET",
+"category": "Set",
+"cost": 1,
+"image": "LSAEF.png",
+"bundled": [
+"LBATN.",
+"LMAZW.",
+"LHANP."
+]
+},
+{
+"id": "LSAEL.",
+"name": "BASEBALL 26 DOUGS",
+"category": "Set",
+"cost": 1,
+"image": "LSAEL.png",
+"bundled": [
+"LBAUK.",
+"LHAOD."
+]
+},
+{
+"id": "LSAEM.",
+"name": "BASEBALL 26 COKUHNUZ",
+"category": "Set",
+"cost": 1,
+"image": "LSAEM.png",
+"bundled": [
+"LHAOC.",
+"LBAUJ."
+]
+},
+{
+"id": "LSAEN.",
+"name": "BASEBALL 26 MONKE",
+"category": "Set",
+"cost": 1,
+"image": "LSAEN.png",
+"bundled": [
+"LHAOB.",
+"LBAUI."
+]
+},
+{
+"id": "LSAEO.",
+"name": "BASEBALL 26 BANANNANNANAS",
+"category": "Set",
+"cost": 1,
+"image": "LSAEO.png",
+"bundled": [
+"LBAUL.",
+"LHAOE."
+]
+},
+{
+"id": "LSAEP.",
+"name": "BANANA BEARD PACK",
+"category": "Set",
+"cost": 1,
+"image": "LSAEP.png",
+"bundled": [
+"LBAUP.",
+"LMBBE.",
+"LFAKA.",
+"LHAOH."
+]
+},
+{
+"id": "LBAUX.",
+"name": "GGG FLIGHT JACKET MOON FACTION",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUX.png"
+},
+{
+"id": "LBAUY.",
+"name": "GGG FLIGHT JACKET STAR FACTION",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAUY.png"
+},
+{
+"id": "LBAVB.",
+"name": "CHIVI WIZARD CAPE",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAVB.png"
+},
+{
+"id": "LBAVC.",
+"name": "NOT ALIENS BUT TEE",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAVC.png"
+},
+{
+"id": "LBAVD.",
+"name": "EVOLVING NINE TAILS",
+"category": "Pants",
+"cost": 1,
+"image": "LBAVD.png"
+},
+{
+"id": "LBAVE.",
+"name": "CHILLY GEAR FUR LINED PARKA",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAVE.png"
+},
+{
+"id": "LBAVF.",
+"name": "G G G PROTOTYPE BODY ARMOR",
+"category": "Shirt",
+"cost": 1,
+"image": "LBAVF.png"
+},
+{
+"id": "LBAVG.",
+"name": "BADGE STAR VS MOON",
+"category": "Badge",
+"cost": 1,
+"image": "LBAVG.png"
+},
+{
+"id": "LFAKE.",
+"name": "GLASSES AVIATORS V2",
+"category": "Face",
+"cost": 1,
+"image": "LFAKE.png"
+},
+{
+"id": "LFAKF.",
+"name": "FAR FUTURE GLASSES V2",
+"category": "Face",
+"cost": 1,
+"image": "LFAKF.png"
+},
+{
+"id": "LFAKG.",
+"name": "CHIVI AVIATOR SUNGLASSES",
+"category": "Face",
+"cost": 1,
+"image": "LFAKG.png"
+},
+{
+"id": "LFAKH.",
+"name": "ENDLESSLY REMOVABLE SUNGLASSES",
+"category": "Face",
+"cost": 1,
+"image": "LFAKH.png"
+},
+{
+"id": "LHAOK.",
+"name": "GGG GENERALS HAT",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOK.png"
+},
+{
+"id": "LHAOM.",
+"name": "TUX HAIR BLOND",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOM.png"
+},
+{
+"id": "LHAON.",
+"name": "CHIVI WITCH HAT",
+"category": "Hat",
+"cost": 1,
+"image": "LHAON.png"
+},
+{
+"id": "LHAOO.",
+"name": "PLAYER TINTED WINGS",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOO.png"
+},
+{
+"id": "LHAOP.",
+"name": "VIM REVERSIBLE BALL CAP",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOP.png"
+},
+{
+"id": "LHAOQ.",
+"name": "G G G PROTOTYPE HELMET",
+"category": "Hat",
+"cost": 1,
+"image": "LHAOQ.png"
+},
+{
+"id": "LMAWF.",
+"name": "BUILDABLE SNOWMAN",
+"category": "Back",
+"cost": 1,
+"image": "LMAWF.png"
+},
+{
+"id": "LMBBN.",
+"name": "CHIVI MOON STAFF",
+"category": "Back",
+"cost": 1,
+"image": "LMBBN.png"
+},
+{
+"id": "LMBBO.",
+"name": "PLUSHIE NESSIE",
+"category": "Back",
+"cost": 1,
+"image": "LMBBO.png"
+},
+{
+"id": "LMBBP.",
+"name": "PERSONAL MESSAGE BOARD",
+"category": "Back",
+"cost": 1,
+"image": "LMBBP.png"
+},
+{
+"id": "LMBBQ.",
+"name": "MOON FACTION PICKET SIGN",
+"category": "Back",
+"cost": 1,
+"image": "LMBBQ.png"
+},
+{
+"id": "LMBBR.",
+"name": "STAR FACTION PICKET SIGN",
+"category": "Back",
+"cost": 1,
+"image": "LMBBR.png"
+},
+{
+"id": "LMBBS.",
+"name": "ENDLESSLY REMOVABLE SUNGLASSES PROJECTILE LEFT",
+"category": "Paw",
+"cost": 1,
+"image": ""
+},
+{
+"id": "LMBBT.",
+"name": "ENDLESSLY REMOVABLE SUNGLASSES PROJECTILE RIGHT",
+"category": "Paw",
+"cost": 1,
+"image": ""
+},
+{
+"id": "LPABF.",
+"name": "PMB PACK BASICS 01",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABF.png"
+},
+{
+"id": "LPABG.",
+"name": "PMB PACK LOCATIONS 01",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABG.png"
+},
+{
+"id": "LPABH.",
+"name": "PMB PACK MANNERS 01",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABH.png"
+},
+{
+"id": "LPABI.",
+"name": "PMB PACK MONKE MEMES 01",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABI.png"
+},
+{
+"id": "LPABP.",
+"name": "CASSETTE TAPE_08",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABP.png"
+},
+{
+"id": "LPABQ.",
+"name": "CASSETTE TAPE_09",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABQ.png"
+},
+{
+"id": "LPABR.",
+"name": "CASSETTE TAPE_10",
+"category": "Collectable",
+"cost": 1,
+"image": "LPABR.png"
+},
+{
+"id": "LSAEQ.",
+"name": "PERSONAL MESSAGE BOARD SET",
+"category": "Set",
+"cost": 1,
+"image": "LSAEQ.png"
 }
 ]
