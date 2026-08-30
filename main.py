@@ -458,6 +458,70 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(embed=embed)
 
     @tree.command(
+        name="check-ban-length",
+        description="Check how long is left on a player's ban.",
+    )
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def check_ban_length_command(
+        interaction: discord.Interaction, user_id: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            row = await supa_admin.fetch_ban(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except (ValueError, supa_admin.SupaError) as error:
+            await interaction.followup.send(str(error))
+            return
+        if row is None:
+            await interaction.followup.send(f"`{uid}` isn't banned. 🎉")
+            return
+
+        until = _ban_expiry(row)
+        if until is None:
+            if row.get("is_permanent") or not row.get("banned_until"):
+                headline = "**Permanent** — there's no clock on this one."
+            else:
+                # Only reachable if banned_until holds something that isn't a
+                # timestamp; say so instead of calling it permanent.
+                headline = (
+                    f"Ends `{row['banned_until']}`, which I couldn't read as a "
+                    "date — check the row in Supabase."
+                )
+            color = EMBED_RED
+        else:
+            unix = int(until.timestamp())
+            remaining = until - datetime.now(timezone.utc)
+            if remaining.total_seconds() <= 0:
+                # The row stays behind once the clock runs out, so an expired ban
+                # still shows up here until someone clears it.
+                headline = (
+                    f"**Expired** <t:{unix}:R> — the ban is over, but the row is "
+                    "still there. Use `/unban` to clear it."
+                )
+                color = EMBED_COLOR
+            else:
+                headline = (
+                    f"**{_format_remaining(remaining)}** left "
+                    f"(ends <t:{unix}:f>, <t:{unix}:R>)."
+                )
+                color = EMBED_RED
+
+        embed = discord.Embed(title="⏳ Ban length", description=headline, color=color)
+        embed.add_field(name="Player", value=f"`{uid}`", inline=False)
+        embed.add_field(
+            name="Reason",
+            value=str(row.get("reason") or "no reason recorded").strip(),
+            inline=False,
+        )
+        await interaction.followup.send(embed=embed)
+
+    @tree.command(
         name="give-ban-perms",
         description="Give a player in-game ban permissions.",
     )
@@ -1129,6 +1193,36 @@ def _joined_lines(lines: list[str], limit: int = 3900) -> str:
         shown.append(line)
         used += cost
     return "\n".join(shown)
+
+
+def _ban_expiry(row: dict) -> datetime | None:
+    """When a banned_players row runs out, or None if it never does.
+
+    An unparseable banned_until is treated as permanent rather than as "already
+    expired", so a bad timestamp can't make a live ban look finished.
+    """
+    if row.get("is_permanent") or not row.get("banned_until"):
+        return None
+    try:
+        return datetime.fromisoformat(str(row["banned_until"]).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_remaining(delta: timedelta) -> str:
+    """A timedelta as the two largest units that matter, e.g. '6d 4h', '12m'."""
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return f"{max(seconds, 1)}s"
+    # Round up to the next whole minute, so 44m59s reads as 45m rather than 44m.
+    seconds = (seconds + 59) // 60 * 60
+    parts = [
+        ("d", seconds // 86400),
+        ("h", seconds % 86400 // 3600),
+        ("m", seconds % 3600 // 60),
+    ]
+    shown = [f"{value}{unit}" for unit, value in parts if value]
+    return " ".join(shown[:2])
 
 
 def _format_ban(row: dict) -> str:
