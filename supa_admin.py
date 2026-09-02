@@ -373,6 +373,83 @@ async def fetch_presence_row(session, supabase_url, key, user_id: str) -> dict |
     return rows[0] if rows else None
 
 
+async def fetch_profile_names(
+    session, supabase_url, key, user_ids: list[str]
+) -> dict[str, str]:
+    """{user_id: display_name} for a batch of players, in one request.
+
+    Ids with no profile row are simply absent from the result, so callers should
+    fall back to showing the raw id.
+    """
+    if not user_ids:
+        return {}
+    rows = await _rest(
+        session, "GET", supabase_url, key, PROFILES_TABLE,
+        params={
+            "select": "user_id,display_name",
+            "user_id": _in_filter(user_ids),
+            "limit": str(len(user_ids)),
+        },
+    ) or []
+    return {
+        str(row["user_id"]): str(row.get("display_name") or "")
+        for row in rows
+        if row.get("user_id")
+    }
+
+
+# --- Ban attribution ---------------------------------------------------------
+
+# banned_players is read a page at a time: PostgREST caps how many rows one
+# response will carry (measured at 1000 on this project) and silently truncates
+# past it, so asking for the whole table in one request would undercount.
+BAN_ISSUER_PAGE = 1000
+# Backstop against an unbounded loop if the ban table ever grows past what this
+# command should be scanning in one go.
+BAN_ISSUER_MAX_ROWS = 100000
+
+
+async def fetch_ban_counts_by_issuer(
+    session, supabase_url, key
+) -> tuple[dict[str, int], int]:
+    """SELECT banned_by, count(1) FROM banned_players GROUP BY banned_by.
+
+    PostgREST has no GROUP BY, so the ids are paged in and tallied here. Only that
+    one column is selected, so the payload stays small even on a big ban table.
+
+    Returns the tally alongside the number of bans with no issuer recorded — older
+    rows and anything banned automatically rather than by a person.
+    """
+    counts: dict[str, int] = {}
+    unattributed = 0
+    offset = 0
+    while offset < BAN_ISSUER_MAX_ROWS:
+        rows = await _rest(
+            session, "GET", supabase_url, key, BANNED_PLAYERS_TABLE,
+            params={
+                "select": "banned_by",
+                # A stable sort, so paging can't skip or double-count a row the
+                # way it could over an unordered result.
+                "order": "id",
+                "limit": str(BAN_ISSUER_PAGE),
+                "offset": str(offset),
+            },
+        ) or []
+        # Advance by what actually came back rather than by the page size: the
+        # server is free to return fewer rows than asked for, and treating a
+        # capped page as the last one would drop every ban after it.
+        if not rows:
+            break
+        for row in rows:
+            issuer = row.get("banned_by")
+            if issuer:
+                counts[str(issuer)] = counts.get(str(issuer), 0) + 1
+            else:
+                unattributed += 1
+        offset += len(rows)
+    return counts, unattributed
+
+
 # --- Redemption codes --------------------------------------------------------
 
 

@@ -458,6 +458,68 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(embed=embed)
 
     @tree.command(
+        name="ban-leaderboard",
+        description="Show who has issued the most bans.",
+    )
+    @app_commands.describe(top="How many to show (default 10, max 50)")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def ban_leaderboard_command(
+        interaction: discord.Interaction,
+        top: app_commands.Range[int, 1, LEADERBOARD_MAX] = LEADERBOARD_DEFAULT,
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            counts, unattributed = await supa_admin.fetch_ban_counts_by_issuer(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+            )
+            # Ties break on the id so the same query twice gives the same order.
+            ranked = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:top]
+            # Only the names actually being rendered are looked up, so this stays
+            # one small request however many staff have ever issued a ban.
+            names = await supa_admin.fetch_profile_names(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                [issuer for issuer, _ in ranked],
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        if not ranked:
+            await interaction.followup.send("No ban has an issuer recorded yet.")
+            return
+
+        lines = []
+        for rank, (issuer, count) in enumerate(ranked, start=1):
+            badge = RANK_BADGES[rank - 1] if rank <= len(RANK_BADGES) else f"`#{rank}`"
+            profile_name = names.get(issuer, "").strip()
+            who = (
+                discord.utils.escape_markdown(_clean_room_name(profile_name))
+                if profile_name
+                else "Unknown"
+            )
+            plural = "ban" if count == 1 else "bans"
+            # Id on its own line under the name: it's what staff copy into the
+            # other ban commands, and inline it would crowd out the count.
+            lines.append(f"{badge} **{who}** — {count:,} {plural}\n　└ `{issuer}`")
+
+        embed = discord.Embed(
+            title=f"🔨 Ban leaderboard — top {len(ranked)}",
+            description=_joined_lines(lines),
+            color=EMBED_RED,
+        )
+        # The unattributed count is worth showing: those bans are real, they just
+        # predate banned_by or were issued by the game rather than by a person.
+        footer = f"{sum(counts.values()):,} bans across {len(counts)} staff"
+        if unattributed:
+            footer += f" · {unattributed:,} more with no issuer recorded"
+        embed.set_footer(text=footer)
+        await interaction.followup.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @tree.command(
         name="check-ban-length",
         description="Check how long is left on a player's ban.",
     )
