@@ -522,6 +522,74 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(embed=embed)
 
     @tree.command(
+        name="username",
+        description="Look up a player's in-game name from their user UUID.",
+    )
+    @app_commands.describe(user_id="Player's user UUID")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def username_command(interaction: discord.Interaction, user_id: str) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        try:
+            uid = supa_admin.validate_user_id(user_id)
+            profile = await supa_admin.fetch_profile(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except (ValueError, supa_admin.SupaError) as error:
+            await interaction.followup.send(str(error))
+            return
+
+        # friendpresence is written by the game client rather than the account
+        # system, so it can still know a name for a UUID with no profile row — and
+        # it's the only table that knows when they were last online. Losing it
+        # shouldn't sink a lookup that already has the profile name.
+        presence: dict | None = None
+        try:
+            presence = await supa_admin.fetch_presence_row(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except supa_admin.SupaError:
+            logger.exception("Could not read presence for %s", uid)
+
+        name = str((profile or {}).get("display_name") or "").strip()
+        source = "current profile name"
+        if not name and presence:
+            name = str(_first_row_value(presence, _PRESENCE_NAME_KEYS) or "").strip()
+            source = "last name the game reported"
+        if not name:
+            await interaction.followup.send(
+                f"No player found with the ID `{uid}` — double-check the UUID."
+            )
+            return
+
+        embed = discord.Embed(
+            title="🔎 Player lookup",
+            description=f"## {discord.utils.escape_markdown(_clean_room_name(name))}",
+            color=EMBED_COLOR,
+        )
+        embed.add_field(name="User ID", value=f"`{uid}`", inline=False)
+        embed.add_field(name="Name source", value=source, inline=False)
+        created = _parse_timestamp((profile or {}).get("created_at"))
+        if created is not None:
+            embed.add_field(
+                name="Profile created",
+                value=f"<t:{int(created.timestamp())}:D> (<t:{int(created.timestamp())}:R>)",
+                inline=False,
+            )
+        if presence:
+            seen = _parse_timestamp(_first_row_value(presence, _PRESENCE_SEEN_KEYS))
+            where = _first_row_value(presence, _PRESENCE_ROOM_KEYS)
+            last_seen = f"<t:{int(seen.timestamp())}:R>" if seen is not None else "unknown"
+            if where:
+                last_seen += f" in room `{where}`"
+            embed.add_field(name="Last seen", value=last_seen, inline=False)
+        await interaction.followup.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @tree.command(
         name="give-ban-perms",
         description="Give a player in-game ban permissions.",
     )
@@ -1251,6 +1319,39 @@ _LEADERBOARD_NAME_KEYS = (
     "player_name", "playerName", "nickname", "name",
 )
 _LEADERBOARD_ID_KEYS = ("player_id", "playerId", "user_id", "id")
+
+# friendpresence is written by the game client too, so /username reads it through
+# the same spelling-tolerant lookup. No id columns here: falling back to the UUID
+# would just echo what staff already typed.
+_PRESENCE_NAME_KEYS = (
+    "displayname", "displayName", "display_name", "username", "user_name",
+    "playername", "playerName", "nickname", "name",
+)
+_PRESENCE_SEEN_KEYS = (
+    "updatedat", "updatedAt", "updated_at", "last_seen", "lastSeen",
+    "last_seen_at", "heartbeat_at",
+)
+_PRESENCE_ROOM_KEYS = ("roomid", "roomId", "room_id", "room", "roomcode", "roomCode")
+
+
+def _first_row_value(row: dict, keys: tuple[str, ...]) -> str | None:
+    """First key in `keys` this row actually has a value for, as a string."""
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _parse_timestamp(raw: object) -> datetime | None:
+    """Supabase ISO 8601 -> datetime, or None if the column is empty or unreadable."""
+    if raw in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _leaderboard_line(rank: int, row: dict) -> str:

@@ -13,6 +13,10 @@ import re
 from datetime import timedelta
 from typing import Any
 
+# Same table supabase_rooms reads for /find-active-rooms; imported rather than
+# re-spelled so a rename only has to happen in one place.
+from supabase_rooms import PRESENCE_TABLE
+
 BAN_PERMISSIONS_TABLE = "ban_permissions"
 BANNED_PLAYERS_TABLE = "banned_players"
 INVENTORY_TABLE = "user_inventory"
@@ -20,6 +24,8 @@ LEADERBOARD_TABLE = "tag_leaderboard"
 TITLE_DATA_TABLE = "title_data"
 CODES_TABLE = "redemption_codes"
 TICKET_CLAIMS_TABLE = "discord_ticket_claims"
+# The account system's own record of a player's name; one row per user_id.
+PROFILES_TABLE = "player_profiles"
 
 # Reads are capped so one command never tries to render an unbounded table.
 LIST_FETCH_LIMIT = 200
@@ -337,6 +343,34 @@ async def fetch_leaderboard(session, supabase_url, key, limit: int) -> list[dict
         session, "GET", supabase_url, key, LEADERBOARD_TABLE,
         params={"select": "*", "order": "total_tags.desc", "limit": str(limit)},
     ) or []
+
+
+# --- Player identity ---------------------------------------------------------
+
+
+async def fetch_profile(session, supabase_url, key, user_id: str) -> dict | None:
+    """SELECT * FROM player_profiles WHERE user_id = ... — the account's current
+    display name. None if the game has never written a profile for this UUID."""
+    rows = await _rest(
+        session, "GET", supabase_url, key, PROFILES_TABLE,
+        params={"select": "*", "user_id": f"eq.{user_id}", "limit": "1"},
+    ) or []
+    return rows[0] if rows else None
+
+
+async def fetch_presence_row(session, supabase_url, key, user_id: str) -> dict | None:
+    """The player's friendpresence row: the name the game client last reported and
+    where it reported from.
+
+    Keyed on playfabid, which holds the same UUID as player_profiles.user_id. The
+    columns are `select: *` because this table is written by the game client and
+    its column names have drifted between versions.
+    """
+    rows = await _rest(
+        session, "GET", supabase_url, key, PRESENCE_TABLE,
+        params={"select": "*", "playfabid": f"eq.{user_id}", "limit": "1"},
+    ) or []
+    return rows[0] if rows else None
 
 
 # --- Redemption codes --------------------------------------------------------
