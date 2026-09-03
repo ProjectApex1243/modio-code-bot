@@ -68,14 +68,48 @@ TICKET_KINDS = {
         "emoji": "⚖️",
         "channel_prefix": "appeal",
         "blurb": "Appeal a ban. A staff member will review it with you here.",
+        "intro": (
+            "Tell us your **in-game name**, your **player UUID** if you know "
+            "it, and why you think the ban should be lifted."
+        ),
+        "color": EMBED_RED,
         "category_env": "TICKET_CATEGORY_ID_APPEAL",
         "default_category_id": 1470654959069696140,
+    },
+    "recover": {
+        "label": "Get your cosmetics back",
+        "emoji": "🎒",
+        "channel_prefix": "recover",
+        "blurb": (
+            "Moved to the new app and your cosmetics are gone? Staff will put "
+            "your old account back on your new one."
+        ),
+        # Everything staff needs is in this list, so the usual four rounds of
+        # "what's your name again?" don't happen.
+        "intro": (
+            "Your cosmetics aren't lost — they're still on your old account. "
+            "Meta gives every app a different id for the same person, so the "
+            "new app doesn't recognise you yet. Staff can link the two.\n\n"
+            "**Please post all of these:**\n"
+            "1. Your **old in-game name**, spelled exactly as it was\n"
+            "2. **Three cosmetics** you know you owned\n"
+            "3. Roughly how many **shiny rocks** you had\n"
+            "4. A screenshot of your old account if you have one\n\n"
+            "If you ever donated, say so — donors are easy for us to confirm."
+        ),
+        "color": EMBED_BLURPLE,
+        "category_env": "TICKET_CATEGORY_ID_RECOVER",
+        # No built-in default: falls back to TICKET_CATEGORY_ID, then to
+        # whatever category the panel itself lives in.
+        "default_category_id": None,
     },
     "other": {
         "label": "Something else",
         "emoji": "💬",
         "channel_prefix": "help",
         "blurb": "Anything else — bugs, reports, questions.",
+        "intro": "Describe what you need help with.",
+        "color": EMBED_BLURPLE,
         "category_env": "TICKET_CATEGORY_ID_OTHER",
         "default_category_id": 1468743079371477093,
     },
@@ -147,6 +181,15 @@ def help_menu_embed() -> discord.Embed:
         value=(
             "Get your free Discord cosmetics right now — no waiting.\n"
             "**One per person, so it can only be claimed once.**"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"{TICKET_KINDS['recover']['emoji']} {TICKET_KINDS['recover']['label']}",
+        value=(
+            TICKET_KINDS["recover"]["blurb"]
+            + "\n**Nothing was deleted** — your old account is still there.\n"
+            "Opens a private channel with staff."
         ),
         inline=False,
     )
@@ -420,18 +463,13 @@ async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None
         )
         return
 
+    spec = TICKET_KINDS[kind]
     embed = discord.Embed(
-        title=f"{TICKET_KINDS[kind]['emoji']} {TICKET_KINDS[kind]['label']}",
+        title=f"{spec['emoji']} {spec['label']}",
         description=(
-            f"{interaction.user.mention} opened this ticket.\n\n"
-            + (
-                "Tell us your **in-game name**, your **player UUID** if you know "
-                "it, and why you think the ban should be lifted."
-                if kind == "appeal"
-                else "Describe what you need help with."
-            )
+            f"{interaction.user.mention} opened this ticket.\n\n" + spec["intro"]
         ),
-        color=EMBED_RED if kind == "appeal" else EMBED_BLURPLE,
+        color=spec.get("color", EMBED_BLURPLE),
         timestamp=datetime.now(timezone.utc),
     )
     embed.add_field(name="What happens next", value=STAFF_REPLY_NOTICE, inline=False)
@@ -560,6 +598,15 @@ class TicketPanelView(_TicketView):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         await handle_cosmetics_claim(interaction)
+
+    @discord.ui.button(
+        label="Get your cosmetics back", emoji="🎒",
+        style=discord.ButtonStyle.primary, custom_id="ticket:recover",
+    )
+    async def recover(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await open_staff_ticket(interaction, "recover")
 
     @discord.ui.button(
         label="Ban appeal", emoji="⚖️",

@@ -1085,6 +1085,194 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    # --- Account recovery (App Lab move) -------------------------------------
+    # Meta gives every app a different id for the same person, so a player on
+    # the new build looks like a stranger. Nothing was lost - these commands
+    # repoint the new Meta id at the account that already exists.
+
+    @tree.command(
+        name="recover-lookup",
+        description="Find a player's old account by their in-game name.",
+    )
+    @app_commands.describe(name="The player's old in-game name, spelled as it was")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def recover_lookup(interaction: discord.Interaction, name: str) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            matches = await supa_admin.find_accounts_by_name(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, name
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        if not matches:
+            await interaction.followup.send(
+                f"No account found with the name **{discord.utils.escape_markdown(name)}**. "
+                "Names are matched exactly (case doesn't matter) — ask them to "
+                "check the spelling."
+            )
+            return
+
+        embed = discord.Embed(
+            title="🎒 Account recovery — candidates",
+            description=(
+                f"**{len(matches)}** account(s) named "
+                f"**{discord.utils.escape_markdown(name)}**.\n"
+                "Names are not unique, so confirm with the cosmetics and rock "
+                "count before running `/recover-account`."
+            ),
+            color=EMBED_COLOR,
+        )
+
+        # Snapshots are four REST calls each, so only the first few are detailed.
+        for row in matches[:5]:
+            uid = str(row.get("user_id"))
+            try:
+                snap = await supa_admin.account_snapshot(
+                    client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+                )
+            except supa_admin.SupaError:
+                logger.exception("Snapshot failed for %s", uid)
+                embed.add_field(name=f"`{uid}`", value="(couldn't read details)", inline=False)
+                continue
+
+            sample = ", ".join(_item_label(i) for i in snap["items"][:6]) or "nothing"
+            lines = [
+                f"**{snap['item_count']}** cosmetics · **{snap['balance']}** {CURRENCY_NAME}",
+                f"Owns: {sample}",
+                f"Meta id: `{snap['meta_user_id'] or 'unknown'}`",
+            ]
+            seen = _parse_timestamp(snap.get("last_seen"))
+            if seen is not None:
+                lines.append(f"Last login: <t:{int(seen.timestamp())}:R>")
+            if snap["already_migrated"]:
+                lines.append(
+                    "⚠️ **Already recovered** onto Meta id "
+                    f"`{snap['already_migrated'].get('new_meta_user_id')}`"
+                )
+            embed.add_field(name=f"`{uid}`", value="\n".join(lines), inline=False)
+
+        if len(matches) > 5:
+            embed.set_footer(text=f"+{len(matches) - 5} more not shown")
+
+        await interaction.followup.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    @tree.command(
+        name="recover-account",
+        description="Put a player's old account back on their new Meta id.",
+    )
+    @app_commands.describe(
+        old_user_id="The old account's player UUID (from /recover-lookup)",
+        new_meta_id="Their Meta user id on the new app (digits only)",
+    )
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def recover_account_command(
+        interaction: discord.Interaction, old_user_id: str, new_meta_id: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            uid = supa_admin.validate_user_id(old_user_id)
+            meta_id = supa_admin.validate_meta_id(new_meta_id)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        try:
+            snap = await supa_admin.account_snapshot(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+            result = await supa_admin.recover_account(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                old_user_id=uid, new_meta_user_id=meta_id,
+                staff=str(interaction.user),
+            )
+        except supa_admin.SupaError as error:
+            # claim_execute refuses rather than half-doing it, and every step
+            # rolls itself back, so nobody is stranded when this happens.
+            await interaction.followup.send(
+                f"❌ Recovery didn't go through — **nothing was changed**.\n`{error}`"
+            )
+            return
+
+        embed = discord.Embed(
+            title="🎒 Account recovered",
+            description=(
+                f"**{snap['item_count']}** cosmetics and **{snap['balance']}** "
+                f"{CURRENCY_NAME} are now on Meta id `{meta_id}`."
+            ),
+            color=EMBED_COLOR,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Old account", value=f"`{uid}`", inline=False)
+        embed.add_field(
+            name="Previous Meta id",
+            value=f"`{result.get('old_meta_user_id') or 'unknown'}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="Tell the player",
+            value=(
+                "**Fully close the game and open it again.** Their cosmetics "
+                "will be there when it loads."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text=f"Recovered by {interaction.user}")
+        await interaction.followup.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none()
+        )
+        logger.info("Recovered %s onto Meta id %s (by %s)", uid, meta_id, interaction.user)
+
+    @tree.command(
+        name="recover-undo",
+        description="Undo a recovery that went to the wrong person.",
+    )
+    @app_commands.describe(
+        new_meta_id="The Meta id the account was moved onto",
+        reason="Why it's being undone",
+    )
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def recover_undo(
+        interaction: discord.Interaction, new_meta_id: str, reason: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            meta_id = supa_admin.validate_meta_id(new_meta_id)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        try:
+            result = await supa_admin.revert_recovery(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                new_meta_user_id=meta_id, reason=f"{reason} (by {interaction.user})",
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(f"❌ Couldn't undo it.\n`{error}`")
+            return
+
+        await interaction.followup.send(
+            f"✅ Undone. Account `{result.get('old_user_id')}` is back on its "
+            "original Meta id and can be recovered again.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        logger.info("Reverted recovery for Meta id %s (by %s)", meta_id, interaction.user)
+
     @tree.command(
         name="prune-unverified",
         description=f"Kick every member with the {UNVERIFIED_ROLE_NAME} role. Server owner only.",

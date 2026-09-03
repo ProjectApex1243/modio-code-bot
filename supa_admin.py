@@ -511,3 +511,211 @@ async def disable_code(session, supabase_url, key, code: str) -> bool:
         json_body={"enabled": False}, representation=True,
     )
     return bool(rows)
+
+
+# --- Account recovery (App Lab move) -----------------------------------------
+#
+# Meta user ids are APP-SCOPED, so the same person gets a different id under a
+# new App ID and the new build cannot find their account. Nothing is lost: every
+# table keys on the auth uuid, not the Meta id. Recovery moves no data, it just
+# repoints the new Meta id at the uuid that already exists:
+#
+#   1. the throwaway account from the new build's first login releases the email
+#   2. platform_identities.meta_user_id  -> the new id   (claim_execute)
+#   3. auth.users.email -> meta_<new>@oculus.device      (GoTrue Admin API)
+#
+# After that the unmodified login path lands the player in their old account.
+# Every step is undone in reverse if a later one fails, so a half-finished
+# recovery never leaves someone locked out of both accounts.
+
+PLATFORM_IDENTITIES_TABLE = "platform_identities"
+CURRENCY_TABLE = "user_currency"
+MIGRATIONS_TABLE = "identity_migrations"
+
+# Meta ids are numeric; anything else is a typo or a paste of the wrong field.
+_META_ID_RE = re.compile(r"^[0-9]{1,32}$")
+
+
+def validate_meta_id(raw: str) -> str:
+    """Normalizes a Meta user id typed by staff."""
+    cleaned = raw.strip()
+    if not _META_ID_RE.match(cleaned):
+        raise ValueError(
+            f"`{raw.strip()}` doesn't look like a Meta user id. It should be "
+            "digits only, e.g. `9328074697317217`."
+        )
+    return cleaned
+
+
+def _quoted(value: str) -> str:
+    """PostgREST-safe quoted filter value; names contain spaces and commas."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+async def rpc(session, supabase_url, key, function: str, payload: dict | None = None):
+    """POST /rest/v1/rpc/<function>. Same auth and error handling as _rest."""
+    return await _rest(
+        session, "POST", supabase_url, key, f"rpc/{function}",
+        json_body=payload or {},
+    )
+
+
+async def admin_user_id_for_email(session, supabase_url, key, email: str) -> str | None:
+    """The auth uuid behind an email, via the same RPC meta-verify uses."""
+    result = await rpc(
+        session, supabase_url, key, "admin_get_user_id_by_email", {"p_email": email}
+    )
+    return str(result) if result else None
+
+
+async def admin_set_email(session, supabase_url, key, user_id: str, email: str) -> None:
+    """PUT /auth/v1/admin/users/<id> - GoTrue's admin update.
+
+    Done through GoTrue rather than an UPDATE on auth.users so its own
+    bookkeeping (auth.identities) stays consistent.
+    """
+    endpoint = f"{supabase_url}/auth/v1/admin/users/{user_id}"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    async with session.put(
+        endpoint, headers=headers, json={"email": email, "email_confirm": True}
+    ) as response:
+        if response.status not in (200, 201):
+            raise SupaError(response.status, await response.text())
+
+
+async def find_accounts_by_name(
+    session, supabase_url, key, display_name: str, limit: int = 8
+) -> list[dict]:
+    """Old accounts whose in-game name matches, case-insensitively.
+
+    Names are not unique - only 17,119 of 38,633 are - so this returns every
+    match and leaves the choosing to staff, who have the ticket in front of them.
+    """
+    return await _rest(
+        session, "GET", supabase_url, key, PROFILES_TABLE,
+        params={
+            "select": "user_id,display_name,created_at",
+            "display_name": f"ilike.{_quoted(display_name.strip())}",
+            "limit": str(limit),
+        },
+    ) or []
+
+
+async def account_snapshot(session, supabase_url, key, user_id: str) -> dict:
+    """Enough about one account for staff to tell two same-named players apart."""
+    items = await fetch_inventory(session, supabase_url, key, user_id)
+
+    identity = await _rest(
+        session, "GET", supabase_url, key, PLATFORM_IDENTITIES_TABLE,
+        params={
+            "select": "meta_user_id,verified_at",
+            "user_id": f"eq.{user_id}", "platform": "eq.oculus", "limit": "1",
+        },
+    ) or []
+
+    currency = await _rest(
+        session, "GET", supabase_url, key, CURRENCY_TABLE,
+        params={"select": "balance", "user_id": f"eq.{user_id}", "limit": "1"},
+    ) or []
+
+    migrated = await _rest(
+        session, "GET", supabase_url, key, MIGRATIONS_TABLE,
+        params={
+            "select": "new_meta_user_id,claimed_at,claimed_by",
+            "old_user_id": f"eq.{user_id}", "reverted_at": "is.null", "limit": "1",
+        },
+    ) or []
+
+    return {
+        "user_id": user_id,
+        "items": items,
+        "item_count": len(items),
+        "meta_user_id": (identity[0].get("meta_user_id") if identity else None),
+        "last_seen": (identity[0].get("verified_at") if identity else None),
+        "balance": (currency[0].get("balance") if currency else 0),
+        "already_migrated": (migrated[0] if migrated else None),
+    }
+
+
+async def recover_account(
+    session, supabase_url, key, *,
+    old_user_id: str, new_meta_user_id: str, staff: str,
+) -> dict:
+    """Move an old account onto a new Meta id. Raises SupaError on refusal.
+
+    Ordering matters and is not arbitrary: auth.users.email is unique, so the
+    throwaway account has to let go of the address before the old account can
+    take it. Each step records what it needs to undo itself.
+    """
+    new_email = f"meta_{new_meta_user_id}@oculus.device"
+
+    parked_id = await admin_user_id_for_email(session, supabase_url, key, new_email)
+    parked_freed = False
+
+    # 1. Free the email from the throwaway account the new build just made.
+    if parked_id and parked_id != old_user_id:
+        await admin_set_email(
+            session, supabase_url, key, parked_id, f"parked_{parked_id}@apex.local"
+        )
+        parked_freed = True
+
+    # 2. Database side: repoint the identity and write the audit row.
+    try:
+        result = await rpc(
+            session, supabase_url, key, "claim_execute",
+            {
+                "p_old_user_id": old_user_id,
+                "p_new_meta_user_id": new_meta_user_id,
+                "p_via": "discord",
+                "p_by": staff,
+            },
+        )
+    except SupaError:
+        if parked_freed:
+            await admin_set_email(session, supabase_url, key, parked_id, new_email)
+        raise
+
+    if not result or not result.get("ok"):
+        if parked_freed:
+            await admin_set_email(session, supabase_url, key, parked_id, new_email)
+        raise SupaError(409, (result or {}).get("error", "claim_execute refused it"))
+
+    # 3. Auth side: the old account takes the new address, which is what makes
+    #    the untouched login path land the player in it.
+    try:
+        await admin_set_email(session, supabase_url, key, old_user_id, new_email)
+    except SupaError:
+        await rpc(
+            session, supabase_url, key, "claim_revert",
+            {"p_new_meta_user_id": new_meta_user_id,
+             "p_reason": "auth email move failed, rolled back"},
+        )
+        if parked_freed:
+            await admin_set_email(session, supabase_url, key, parked_id, new_email)
+        raise
+
+    result["parked_user_id"] = parked_id if parked_freed else None
+    return result
+
+
+async def revert_recovery(
+    session, supabase_url, key, *, new_meta_user_id: str, reason: str
+) -> dict:
+    """Undo one recovery: identity back, email back, audit row closed."""
+    result = await rpc(
+        session, supabase_url, key, "claim_revert",
+        {"p_new_meta_user_id": new_meta_user_id, "p_reason": reason},
+    )
+    if not result or not result.get("ok"):
+        raise SupaError(404, (result or {}).get("error", "no live recovery to revert"))
+
+    restore_email = result.get("restore_email")
+    if restore_email and result.get("old_user_id"):
+        await admin_set_email(
+            session, supabase_url, key, str(result["old_user_id"]), restore_email
+        )
+    return result
