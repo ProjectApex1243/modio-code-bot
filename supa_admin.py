@@ -816,3 +816,62 @@ async def find_solved_attempt(session, supabase_url, key, rate_key: str) -> dict
         },
     ) or []
     return rows[0] if rows else None
+
+
+async def linked_account_for_discord(
+    session, supabase_url, key, discord_id: str
+) -> dict | None:
+    """The player account already tied to this Discord user, if there is one.
+
+    The link is a by-product of the Discord-cosmetics ticket: the bot minted a
+    single-use code against their Discord id, and redeeming it in game recorded
+    that account against the code. So
+
+        discord_ticket_claims.code -> code_redemptions.code -> user_id
+
+    is real evidence, not a guess - they held both ends at the time. It is
+    strictly stronger than the cosmetics quiz, so anyone who has it can skip
+    the quiz entirely.
+
+    Returns None when there is no link, and also when a Discord id somehow
+    resolves to more than one account. Every one of the 279 live links is
+    currently 1:1, so the plural case means something unexpected - and guessing
+    which account to hand over is exactly the mistake worth refusing to make.
+    """
+    claims = await _rest(
+        session, "GET", supabase_url, key, TICKET_CLAIMS_TABLE,
+        params={"select": "code", "discord_id": f"eq.{discord_id}"},
+    ) or []
+
+    codes = [str(c["code"]) for c in claims if c.get("code")]
+    if not codes:
+        return None
+
+    redemptions = await _rest(
+        session, "GET", supabase_url, key, "code_redemptions",
+        params={"select": "user_id,code,redeemed_at", "code": _in_filter(codes)},
+    ) or []
+
+    user_ids = {str(r["user_id"]) for r in redemptions if r.get("user_id")}
+    if len(user_ids) != 1:
+        return None
+
+    user_id = user_ids.pop()
+
+    profile = await fetch_profile(session, supabase_url, key, user_id) or {}
+    items = await fetch_inventory(session, supabase_url, key, user_id)
+
+    migrated = await _rest(
+        session, "GET", supabase_url, key, MIGRATIONS_TABLE,
+        params={
+            "select": "new_meta_user_id,claimed_at",
+            "old_user_id": f"eq.{user_id}", "reverted_at": "is.null", "limit": "1",
+        },
+    ) or []
+
+    return {
+        "user_id": user_id,
+        "display_name": profile.get("display_name"),
+        "item_count": len(items),
+        "already_migrated": (migrated[0] if migrated else None),
+    }

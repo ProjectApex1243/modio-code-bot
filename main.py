@@ -190,6 +190,31 @@ def _recovery_token(discord_id: int) -> str:
     return f"APEX{body}"
 
 
+def _token_instructions(token: str, *, account: str | None = None) -> discord.Embed:
+    """The 'now rename your new account' screen.
+
+    Shared by both routes into it — the quiz and the already-linked shortcut —
+    so the instructions can't drift into two slightly different versions.
+    """
+    found = (
+        f"Found your account: **{discord.utils.escape_markdown(account)}**\n\n"
+        if account
+        else ""
+    )
+    return discord.Embed(
+        title="✅ One step left",
+        description=(
+            f"{found}Now prove the **new** account is yours.\n\n"
+            "In the new app, open the computer, go to the **NAME** tab and set "
+            f"your name to exactly:\n\n# `{token}`\n\n"
+            "Then come back and run **`/recover-finish`**.\n\n"
+            "*This name is only yours, so nobody else can be pointed at your "
+            "account. Change it back to whatever you like once it's done.*"
+        ),
+        color=EMBED_COLOR,
+    )
+
+
 def _rate_key(discord_id: int) -> str:
     """Rate-limit / pending-state key for claim_attempts.
 
@@ -274,21 +299,7 @@ class RecoverQuizView(discord.ui.View):
 
         token = _recovery_token(interaction.user.id)
         await interaction.followup.send(
-            embed=discord.Embed(
-                title="✅ That's your account — one step left",
-                description=(
-                    "Now prove the **new** account is yours.\n\n"
-                    f"In the new app, open the computer, go to the **NAME** tab "
-                    f"and set your name to exactly:\n\n"
-                    f"# `{token}`\n\n"
-                    "Then come back and run **`/recover-finish`**.\n\n"
-                    "*This name is only yours, so nobody else can be pointed at "
-                    "your account. Change it back to whatever you like once it's "
-                    "done.*"
-                ),
-                color=EMBED_COLOR,
-            ),
-            ephemeral=True,
+            embed=_token_instructions(token), ephemeral=True
         )
         logger.info("Quiz passed by %s, awaiting token %s", interaction.user, token)
 
@@ -1406,10 +1417,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         description="Get your old cosmetics onto your new account. No staff needed.",
     )
     @app_commands.describe(
-        old_name="Your OLD in-game name, spelled exactly as it was",
+        old_name="Your OLD in-game name — only needed if you never claimed "
+                 "Discord cosmetics here",
     )
     async def recover_self_serve(
-        interaction: discord.Interaction, old_name: str
+        interaction: discord.Interaction, old_name: str | None = None
     ) -> None:
         # Deliberately not role-gated: this is the only route players have.
         # The quiz is the gate, and claim_start rate-limits per Discord user.
@@ -1417,6 +1429,46 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         if not await _ensure_service_key(interaction):
             return
         client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        # Anyone who claimed Discord cosmetics already proved which account is
+        # theirs, by redeeming a code minted against this Discord id on it.
+        # That beats a memory quiz, so skip straight to the rename.
+        try:
+            linked = await supa_admin.linked_account_for_discord(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                str(interaction.user.id),
+            )
+        except supa_admin.SupaError:
+            logger.exception("Link lookup failed for %s", interaction.user.id)
+            linked = None  # fall through to the quiz rather than dead-ending
+
+        if linked is not None:
+            if linked.get("already_migrated"):
+                await interaction.followup.send(
+                    "Your account has already been recovered onto a new one. If "
+                    "that wasn't you, open a ticket.", ephemeral=True,
+                )
+                return
+            await interaction.followup.send(
+                embed=_token_instructions(
+                    _recovery_token(interaction.user.id),
+                    account=str(linked.get("display_name") or "your account"),
+                ),
+                ephemeral=True,
+            )
+            logger.info(
+                "Linked shortcut for %s -> %s", interaction.user, linked["user_id"]
+            )
+            return
+
+        if not old_name:
+            await interaction.followup.send(
+                "I don't have your Discord linked to a player account, so I need "
+                "your **old in-game name** to find it:\n"
+                "`/recover old_name: YourOldName`",
+                ephemeral=True,
+            )
+            return
 
         try:
             started = await supa_admin.claim_start(
@@ -1480,16 +1532,33 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
         token = _recovery_token(interaction.user.id)
 
+        # Two ways to have earned this: an existing Discord link, or a passed
+        # quiz. Same order as /recover, so the two commands agree on which
+        # account is being moved.
         try:
-            attempt = await supa_admin.find_solved_attempt(
+            linked = await supa_admin.linked_account_for_discord(
                 client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-                _rate_key(interaction.user.id),
+                str(interaction.user.id),
+            )
+            attempt = (
+                None
+                if linked
+                else await supa_admin.find_solved_attempt(
+                    client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                    _rate_key(interaction.user.id),
+                )
             )
         except supa_admin.SupaError as error:
             await interaction.followup.send(str(error), ephemeral=True)
             return
 
-        if not attempt:
+        if linked:
+            old_user_id = str(linked["user_id"])
+            old_label = str(linked.get("display_name") or "Your account")
+        elif attempt:
+            old_user_id = str(attempt["candidate_user_id"])
+            old_label = str(attempt["display_name"])
+        else:
             await interaction.followup.send(
                 "You haven't passed the cosmetics quiz yet — run **`/recover`** "
                 "first.", ephemeral=True,
@@ -1529,7 +1598,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         try:
             await supa_admin.recover_account(
                 client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-                old_user_id=str(attempt["candidate_user_id"]),
+                old_user_id=old_user_id,
                 new_meta_user_id=str(target["meta_user_id"]),
                 staff=f"self-service ({interaction.user})",
             )
@@ -1545,7 +1614,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             embed=discord.Embed(
                 title="✅ Got it back",
                 description=(
-                    f"**{discord.utils.escape_markdown(str(attempt['display_name']))}** "
+                    f"**{discord.utils.escape_markdown(old_label)}** "
                     "is yours again on the new app.\n\n"
                     "**Fully close the game and open it again** — your cosmetics "
                     "will be there when it loads, and you can set your name back "
@@ -1557,7 +1626,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
         logger.info(
             "Self-service recovery: %s -> Meta id %s (by %s)",
-            attempt["candidate_user_id"], target["meta_user_id"], interaction.user,
+            old_user_id, target["meta_user_id"], interaction.user,
         )
 
     @tree.command(
