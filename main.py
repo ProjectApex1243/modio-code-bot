@@ -7,6 +7,7 @@ supabase_rooms.py so this file stays focused on Discord + hosting wiring.
 """
 
 import asyncio
+import hashlib
 import os
 import logging
 import re
@@ -165,6 +166,39 @@ class ConfirmView(discord.ui.View):
         self.stop()
 
 
+# Alphabet with I, O, 0, 1 and L removed: this gets typed on a VR keyboard and
+# read back off a Discord message, so confusable glyphs cost support tickets.
+_TOKEN_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+
+def _recovery_token(discord_id: int) -> str:
+    """The name a player is told to set in the new app to prove it is theirs.
+
+    Assigned rather than chosen. Letting someone type their own new name meant
+    two people could pick the same one, and meant a name could be set to match
+    somebody else's — the bot would then have no way to tell which account it
+    was looking at. A token nobody else can be issued removes both.
+
+    Derived from the Discord id rather than stored: the quiz and the name change
+    are separate commands, possibly minutes and a bot restart apart, and a
+    derived token cannot drift out of sync with a table.
+
+    10 characters, inside the 12-char in-game limit (GorillaComputer.cs:4161).
+    """
+    digest = hashlib.sha256(f"apex-recovery:{discord_id}".encode()).digest()
+    body = "".join(_TOKEN_ALPHABET[b % len(_TOKEN_ALPHABET)] for b in digest[:6])
+    return f"APEX{body}"
+
+
+def _rate_key(discord_id: int) -> str:
+    """Rate-limit / pending-state key for claim_attempts.
+
+    The real Meta id isn't known until the player has renamed their new
+    account, so the Discord id stands in for it while the quiz happens.
+    """
+    return f"discord:{discord_id}"
+
+
 class RecoverQuizView(discord.ui.View):
     """The "pick the 3 cosmetics you owned" gate for /recover.
 
@@ -175,11 +209,10 @@ class RecoverQuizView(discord.ui.View):
     """
 
     def __init__(
-        self, *, attempt_id: str, options: list[str], new_meta_id: str, invoker_id: int
+        self, *, attempt_id: str, options: list[str], invoker_id: int
     ) -> None:
         super().__init__(timeout=600)
         self.attempt_id = attempt_id
-        self.new_meta_id = new_meta_id
         self.invoker_id = invoker_id
         self.select = discord.ui.Select(
             placeholder="Pick the 3 cosmetics you owned",
@@ -233,45 +266,31 @@ class RecoverQuizView(discord.ui.View):
             await interaction.followup.send(text, ephemeral=True)
             return
 
-        # Passed. Resolve the account behind the attempt and do the swap.
-        try:
-            old_user_id = await supa_admin.claim_attempt_account(
-                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-                self.attempt_id,
-            )
-            if not old_user_id:
-                raise supa_admin.SupaError(500, "attempt vanished")
-            result = await supa_admin.recover_account(
-                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-                old_user_id=old_user_id, new_meta_user_id=self.new_meta_id,
-                staff=f"self-service quiz ({interaction.user})",
-            )
-        except supa_admin.SupaError as error:
-            await interaction.followup.send(
-                "You got the quiz right, but the move itself failed — "
-                f"**nothing was changed**. Open a ticket and quote this:\n`{error}`",
-                ephemeral=True,
-            )
-            return
-
+        # Passed. That proves the OLD account. Nothing moves yet — the second
+        # half proves they control the NEW one, which is what the token is for.
+        # The pass is recorded on the attempt row, so this survives a restart.
         self.select.disabled = True
         self.stop()
+
+        token = _recovery_token(interaction.user.id)
         await interaction.followup.send(
             embed=discord.Embed(
-                title="✅ Got it back",
+                title="✅ That's your account — one step left",
                 description=(
-                    "Your old account is now yours on the new app.\n\n"
-                    "**Fully close the game and open it again** — your cosmetics "
-                    "will be there when it loads."
+                    "Now prove the **new** account is yours.\n\n"
+                    f"In the new app, open the computer, go to the **NAME** tab "
+                    f"and set your name to exactly:\n\n"
+                    f"# `{token}`\n\n"
+                    "Then come back and run **`/recover-finish`**.\n\n"
+                    "*This name is only yours, so nobody else can be pointed at "
+                    "your account. Change it back to whatever you like once it's "
+                    "done.*"
                 ),
                 color=EMBED_COLOR,
             ),
             ephemeral=True,
         )
-        logger.info(
-            "Self-service recovery: %s -> Meta id %s (by %s)",
-            old_user_id, self.new_meta_id, interaction.user,
-        )
+        logger.info("Quiz passed by %s, awaiting token %s", interaction.user, token)
 
 
 def register_commands(tree: app_commands.CommandTree) -> None:
@@ -1388,51 +1407,21 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     )
     @app_commands.describe(
         old_name="Your OLD in-game name, spelled exactly as it was",
-        new_name="Your NEW in-game name, from the computer in the new app",
     )
     async def recover_self_serve(
-        interaction: discord.Interaction, old_name: str, new_name: str
+        interaction: discord.Interaction, old_name: str
     ) -> None:
         # Deliberately not role-gated: this is the only route players have.
-        # The quiz is the gate, and claim_start rate-limits by target account.
+        # The quiz is the gate, and claim_start rate-limits per Discord user.
         await interaction.response.defer(ephemeral=True)
         if not await _ensure_service_key(interaction):
             return
         client: RoomBot = interaction.client  # type: ignore[assignment]
 
         try:
-            targets = await supa_admin.find_new_account(
-                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, new_name
-            )
-        except supa_admin.SupaError as error:
-            await interaction.followup.send(str(error), ephemeral=True)
-            return
-
-        if not targets:
-            await interaction.followup.send(
-                "I can't find a **new** account called "
-                f"**{discord.utils.escape_markdown(new_name)}**.\n\n"
-                "Install the new app and log in once first — that's what creates "
-                "the account I move your cosmetics onto. Then check the name on "
-                "the computer and run this again.",
-                ephemeral=True,
-            )
-            return
-        if len(targets) > 1:
-            await interaction.followup.send(
-                f"There's more than one new account called "
-                f"**{discord.utils.escape_markdown(new_name)}**, so I can't tell "
-                "which is yours. Change your name in the new app to something "
-                "unusual, then run this again — or open a ticket.",
-                ephemeral=True,
-            )
-            return
-
-        target = targets[0]
-        try:
             started = await supa_admin.claim_start(
                 client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-                old_name, str(target["meta_user_id"]),
+                old_name, _rate_key(interaction.user.id),
             )
         except supa_admin.SupaError as error:
             await interaction.followup.send(str(error), ephemeral=True)
@@ -1474,10 +1463,101 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             view=RecoverQuizView(
                 attempt_id=str(first["attempt_id"]),
                 options=[str(o) for o in first["options"]],
-                new_meta_id=str(target["meta_user_id"]),
                 invoker_id=interaction.user.id,
             ),
             ephemeral=True,
+        )
+
+    @tree.command(
+        name="recover-finish",
+        description="Finish recovery after renaming your new account to the token.",
+    )
+    async def recover_finish(interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        token = _recovery_token(interaction.user.id)
+
+        try:
+            attempt = await supa_admin.find_solved_attempt(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                _rate_key(interaction.user.id),
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+
+        if not attempt:
+            await interaction.followup.send(
+                "You haven't passed the cosmetics quiz yet — run **`/recover`** "
+                "first.", ephemeral=True,
+            )
+            return
+
+        try:
+            targets = await supa_admin.find_account_by_exact_name(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, token
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+
+        if not targets:
+            await interaction.followup.send(
+                f"No account is named `{token}` yet.\n\n"
+                "In the **new app**, open the computer, go to the **NAME** tab and "
+                f"set your name to exactly `{token}`, then run this again. If you "
+                "haven't installed the new app and logged in once, do that first — "
+                "that's what creates the account your cosmetics move onto.",
+                ephemeral=True,
+            )
+            return
+        if len(targets) > 1:
+            # Should be impossible with an assigned token, so it means something
+            # is wrong rather than that the player did something wrong.
+            logger.error("Token %s matched %d accounts", token, len(targets))
+            await interaction.followup.send(
+                "Something's off on our end — that name matched more than one "
+                "account. Open a ticket and staff will finish it by hand.",
+                ephemeral=True,
+            )
+            return
+
+        target = targets[0]
+        try:
+            await supa_admin.recover_account(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                old_user_id=str(attempt["candidate_user_id"]),
+                new_meta_user_id=str(target["meta_user_id"]),
+                staff=f"self-service ({interaction.user})",
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(
+                "The move didn't go through — **nothing was changed**. Open a "
+                f"ticket and quote this:\n`{error}`",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="✅ Got it back",
+                description=(
+                    f"**{discord.utils.escape_markdown(str(attempt['display_name']))}** "
+                    "is yours again on the new app.\n\n"
+                    "**Fully close the game and open it again** — your cosmetics "
+                    "will be there when it loads, and you can set your name back "
+                    "to whatever you want."
+                ),
+                color=EMBED_COLOR,
+            ),
+            ephemeral=True,
+        )
+        logger.info(
+            "Self-service recovery: %s -> Meta id %s (by %s)",
+            attempt["candidate_user_id"], target["meta_user_id"], interaction.user,
         )
 
     @tree.command(

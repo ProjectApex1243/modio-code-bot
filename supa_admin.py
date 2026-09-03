@@ -757,14 +757,16 @@ async def claim_answer(session, supabase_url, key, attempt_id: str, picked: list
     ) or {}
 
 
-async def find_new_account(
+async def find_account_by_exact_name(
     session, supabase_url, key, display_name: str
 ) -> list[dict]:
-    """The account the player just made in the new app, found by its name.
+    """Recently-created accounts whose name is exactly this.
 
-    Restricted to recently created profiles: the same name almost certainly
-    also belongs to their old account, and moving an account onto itself is
-    not a migration.
+    Used with a bot-assigned token rather than a name the player chose, so in
+    practice this returns one row or none. Still returns a list: two people
+    setting the same name is the exact failure this is here to catch, and
+    silently taking the first would be how an account gets moved to the wrong
+    person.
     """
     cutoff = (
         datetime.now(timezone.utc) - timedelta(days=NEW_ACCOUNT_WINDOW_DAYS)
@@ -776,12 +778,10 @@ async def find_new_account(
             "select": "user_id,display_name,created_at",
             "display_name": f"ilike.{_quoted(display_name.strip())}",
             "created_at": f"gte.{cutoff}",
-            "order": "created_at.desc",
             "limit": "5",
         },
     ) or []
 
-    # Only accounts that actually carry a Meta id are usable as a target.
     out = []
     for row in rows:
         uid = str(row.get("user_id"))
@@ -794,25 +794,25 @@ async def find_new_account(
         ) or []
         if identity and identity[0].get("meta_user_id"):
             row["meta_user_id"] = identity[0]["meta_user_id"]
-            row["item_count"] = len(
-                await fetch_inventory(session, supabase_url, key, uid)
-            )
             out.append(row)
     return out
 
 
-async def claim_attempt_account(session, supabase_url, key, attempt_id: str) -> str | None:
-    """Which account a solved attempt points at.
+async def find_solved_attempt(session, supabase_url, key, rate_key: str) -> dict | None:
+    """The most recent quiz this Discord user passed.
 
-    claim_answer deliberately does not return this - the attempt id is an
-    opaque handle so a client cannot enumerate accounts - so the swap looks it
-    up here with the service role once the quiz is passed.
+    The quiz and the name change happen in two separate commands, possibly
+    minutes apart and across a bot restart, so the "they already proved the old
+    account" state lives in claim_attempts rather than in bot memory.
     """
     rows = await _rest(
         session, "GET", supabase_url, key, "claim_attempts",
         params={
-            "select": "candidate_user_id,solved",
-            "id": f"eq.{attempt_id}", "solved": "is.true", "limit": "1",
+            "select": "id,candidate_user_id,display_name,created_at",
+            "new_meta_user_id": f"eq.{rate_key}",
+            "solved": "is.true",
+            "order": "created_at.desc",
+            "limit": "1",
         },
     ) or []
-    return str(rows[0]["candidate_user_id"]) if rows else None
+    return rows[0] if rows else None
