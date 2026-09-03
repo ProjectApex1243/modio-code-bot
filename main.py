@@ -165,6 +165,115 @@ class ConfirmView(discord.ui.View):
         self.stop()
 
 
+class RecoverQuizView(discord.ui.View):
+    """The "pick the 3 cosmetics you owned" gate for /recover.
+
+    Short-lived and ephemeral on purpose. It must never be registered as a
+    persistent view — see tickets.help_menu_embed for what that does to the
+    dispatch table — and the attempt behind it expires server-side after 30
+    minutes regardless.
+    """
+
+    def __init__(
+        self, *, attempt_id: str, options: list[str], new_meta_id: str, invoker_id: int
+    ) -> None:
+        super().__init__(timeout=600)
+        self.attempt_id = attempt_id
+        self.new_meta_id = new_meta_id
+        self.invoker_id = invoker_id
+        self.select = discord.ui.Select(
+            placeholder="Pick the 3 cosmetics you owned",
+            min_values=3,
+            max_values=3,
+            options=[
+                discord.SelectOption(label=_item_label(o)[:100], value=o[:100])
+                for o in options
+            ],
+        )
+        self.select.callback = self._on_pick
+        self.add_item(self.select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "This isn't your recovery.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        picked = list(self.select.values)
+
+        try:
+            verdict = await supa_admin.claim_answer(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                self.attempt_id, picked,
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(f"Something broke: `{error}`", ephemeral=True)
+            return
+
+        if not verdict.get("ok"):
+            code = verdict.get("error")
+            if code == "WRONG":
+                left = int(verdict.get("tries_left") or 0)
+                text = (
+                    f"Not right — **{left}** {'try' if left == 1 else 'tries'} left."
+                    if left
+                    else "That was the last try."
+                )
+            elif code == "TOO_MANY_TRIES":
+                text = "Too many wrong guesses. Open a ticket and staff will help."
+            elif code == "EXPIRED":
+                text = "This took too long. Run `/recover` again."
+            else:
+                text = "That didn't work. Open a ticket and staff will help."
+            await interaction.followup.send(text, ephemeral=True)
+            return
+
+        # Passed. Resolve the account behind the attempt and do the swap.
+        try:
+            old_user_id = await supa_admin.claim_attempt_account(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                self.attempt_id,
+            )
+            if not old_user_id:
+                raise supa_admin.SupaError(500, "attempt vanished")
+            result = await supa_admin.recover_account(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                old_user_id=old_user_id, new_meta_user_id=self.new_meta_id,
+                staff=f"self-service quiz ({interaction.user})",
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(
+                "You got the quiz right, but the move itself failed — "
+                f"**nothing was changed**. Open a ticket and quote this:\n`{error}`",
+                ephemeral=True,
+            )
+            return
+
+        self.select.disabled = True
+        self.stop()
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="✅ Got it back",
+                description=(
+                    "Your old account is now yours on the new app.\n\n"
+                    "**Fully close the game and open it again** — your cosmetics "
+                    "will be there when it loads."
+                ),
+                color=EMBED_COLOR,
+            ),
+            ephemeral=True,
+        )
+        logger.info(
+            "Self-service recovery: %s -> Meta id %s (by %s)",
+            old_user_id, self.new_meta_id, interaction.user,
+        )
+
+
 def register_commands(tree: app_commands.CommandTree) -> None:
     @tree.command(
         name=FIND_ACTIVE_ROOMS_COMMAND_NAME,
@@ -1272,6 +1381,104 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             allowed_mentions=discord.AllowedMentions.none(),
         )
         logger.info("Reverted recovery for Meta id %s (by %s)", meta_id, interaction.user)
+
+    @tree.command(
+        name="recover",
+        description="Get your old cosmetics onto your new account. No staff needed.",
+    )
+    @app_commands.describe(
+        old_name="Your OLD in-game name, spelled exactly as it was",
+        new_name="Your NEW in-game name, from the computer in the new app",
+    )
+    async def recover_self_serve(
+        interaction: discord.Interaction, old_name: str, new_name: str
+    ) -> None:
+        # Deliberately not role-gated: this is the only route players have.
+        # The quiz is the gate, and claim_start rate-limits by target account.
+        await interaction.response.defer(ephemeral=True)
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            targets = await supa_admin.find_new_account(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, new_name
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+
+        if not targets:
+            await interaction.followup.send(
+                "I can't find a **new** account called "
+                f"**{discord.utils.escape_markdown(new_name)}**.\n\n"
+                "Install the new app and log in once first — that's what creates "
+                "the account I move your cosmetics onto. Then check the name on "
+                "the computer and run this again.",
+                ephemeral=True,
+            )
+            return
+        if len(targets) > 1:
+            await interaction.followup.send(
+                f"There's more than one new account called "
+                f"**{discord.utils.escape_markdown(new_name)}**, so I can't tell "
+                "which is yours. Change your name in the new app to something "
+                "unusual, then run this again — or open a ticket.",
+                ephemeral=True,
+            )
+            return
+
+        target = targets[0]
+        try:
+            started = await supa_admin.claim_start(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                old_name, str(target["meta_user_id"]),
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+
+        if started.get("error") == "RATE_LIMITED":
+            await interaction.followup.send(
+                "You've tried a lot of names in a short time. Wait an hour, or "
+                "open a ticket and staff will sort it out.", ephemeral=True,
+            )
+            return
+
+        candidates = started.get("candidates") or []
+        if not candidates:
+            await interaction.followup.send(
+                "No account with cosmetics is named "
+                f"**{discord.utils.escape_markdown(old_name)}**.\n\n"
+                "It has to be spelled the way it was in game. If it's right and "
+                "this still fails, the account may already have been recovered — "
+                "open a ticket.",
+                ephemeral=True,
+            )
+            return
+
+        # One quiz at a time. Same-named accounts are walked in order, which is
+        # rare enough not to be worth a picker.
+        first = candidates[0]
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="🎒 Prove it's your account",
+                description=(
+                    f"Found an account named **{discord.utils.escape_markdown(str(first['name']))}** "
+                    f"with **{first['item_count']}** cosmetics and "
+                    f"**{first['balance']}** {CURRENCY_NAME}.\n\n"
+                    "**Pick the 3 cosmetics you owned.** You get 3 tries."
+                ),
+                color=EMBED_COLOR,
+            ),
+            view=RecoverQuizView(
+                attempt_id=str(first["attempt_id"]),
+                options=[str(o) for o in first["options"]],
+                new_meta_id=str(target["meta_user_id"]),
+                invoker_id=interaction.user.id,
+            ),
+            ephemeral=True,
+        )
 
     @tree.command(
         name="prune-unverified",

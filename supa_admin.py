@@ -10,7 +10,7 @@ client).
 import json
 import math
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # Same table supabase_rooms reads for /find-active-rooms; imported rather than
@@ -719,3 +719,100 @@ async def revert_recovery(
             session, supabase_url, key, str(result["old_user_id"]), restore_email
         )
     return result
+
+
+# --- Self-service recovery (Discord-driven, no client changes) ----------------
+#
+# The old build cannot authenticate any more, so nothing the server writes can
+# reach a player's headset - no ban screen, no REDEEM tab, no MOTD. The proof
+# has to happen somewhere the player can still reach, which is here.
+#
+# The player gives their OLD name and their NEW in-game name (read off the
+# computer in the new app after logging in once). The old name picks candidate
+# accounts, a cosmetics quiz proves which one is theirs, and the new name
+# resolves the Meta id to move it onto. No client code, old or new.
+
+# Accounts created within this window are candidates for "the account they just
+# made in the new app". Wide enough for someone who installed a few days ago,
+# narrow enough that it does not match a five-month-old veteran with the same
+# name.
+NEW_ACCOUNT_WINDOW_DAYS = 30
+
+
+async def claim_start(
+    session, supabase_url, key, display_name: str, new_meta_user_id: str
+) -> dict:
+    """Candidate accounts for a remembered name, each with a cosmetics quiz."""
+    return await rpc(
+        session, supabase_url, key, "claim_start",
+        {"p_display_name": display_name, "p_new_meta_user_id": new_meta_user_id},
+    ) or {}
+
+
+async def claim_answer(session, supabase_url, key, attempt_id: str, picked: list[str]) -> dict:
+    """Check the three items the player picked. Never reveals the answer."""
+    return await rpc(
+        session, supabase_url, key, "claim_answer",
+        {"p_attempt_id": attempt_id, "p_picked": picked},
+    ) or {}
+
+
+async def find_new_account(
+    session, supabase_url, key, display_name: str
+) -> list[dict]:
+    """The account the player just made in the new app, found by its name.
+
+    Restricted to recently created profiles: the same name almost certainly
+    also belongs to their old account, and moving an account onto itself is
+    not a migration.
+    """
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=NEW_ACCOUNT_WINDOW_DAYS)
+    ).isoformat()
+
+    rows = await _rest(
+        session, "GET", supabase_url, key, PROFILES_TABLE,
+        params={
+            "select": "user_id,display_name,created_at",
+            "display_name": f"ilike.{_quoted(display_name.strip())}",
+            "created_at": f"gte.{cutoff}",
+            "order": "created_at.desc",
+            "limit": "5",
+        },
+    ) or []
+
+    # Only accounts that actually carry a Meta id are usable as a target.
+    out = []
+    for row in rows:
+        uid = str(row.get("user_id"))
+        identity = await _rest(
+            session, "GET", supabase_url, key, PLATFORM_IDENTITIES_TABLE,
+            params={
+                "select": "meta_user_id",
+                "user_id": f"eq.{uid}", "platform": "eq.oculus", "limit": "1",
+            },
+        ) or []
+        if identity and identity[0].get("meta_user_id"):
+            row["meta_user_id"] = identity[0]["meta_user_id"]
+            row["item_count"] = len(
+                await fetch_inventory(session, supabase_url, key, uid)
+            )
+            out.append(row)
+    return out
+
+
+async def claim_attempt_account(session, supabase_url, key, attempt_id: str) -> str | None:
+    """Which account a solved attempt points at.
+
+    claim_answer deliberately does not return this - the attempt id is an
+    opaque handle so a client cannot enumerate accounts - so the swap looks it
+    up here with the service role once the quiz is passed.
+    """
+    rows = await _rest(
+        session, "GET", supabase_url, key, "claim_attempts",
+        params={
+            "select": "candidate_user_id,solved",
+            "id": f"eq.{attempt_id}", "solved": "is.true", "limit": "1",
+        },
+    ) or []
+    return str(rows[0]["candidate_user_id"]) if rows else None
