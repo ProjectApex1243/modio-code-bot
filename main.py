@@ -166,6 +166,168 @@ class ConfirmView(discord.ui.View):
         self.stop()
 
 
+# A Supa Manager can already run /recover-account solo - this adds a second
+# person to the loop rather than a role check, since the requester already
+# held the role. RECOVER_APPROVAL_TIMEOUT mirrors RecoverQuizView's 600s.
+RECOVER_APPROVAL_TIMEOUT = 600
+
+
+class RecoverApprovalView(discord.ui.View):
+    """Staged /recover-account request. Nothing moves until a DIFFERENT Supa
+    Manager than the requester presses Approve."""
+
+    def __init__(
+        self, *, requester_id: int, old_user_id: str, new_meta_id: str, snapshot: dict,
+    ) -> None:
+        super().__init__(timeout=RECOVER_APPROVAL_TIMEOUT)
+        self.requester_id = requester_id
+        self.old_user_id = old_user_id
+        self.new_meta_id = new_meta_id
+        self.snapshot = snapshot
+        self.resolved = False
+        self.message: discord.Message | None = None
+
+    def request_embed(self) -> discord.Embed:
+        sample = ", ".join(_item_label(i) for i in self.snapshot["items"][:6]) or "nothing"
+        embed = discord.Embed(
+            title="🎒 Recovery pending approval",
+            description=(
+                f"Move **{self.snapshot['item_count']}** cosmetics and "
+                f"**{self.snapshot['balance']}** {CURRENCY_NAME} onto Meta id "
+                f"`{self.new_meta_id}`.\n\nA **different {SUPA_MANAGER_ROLE_NAME}** "
+                "has to press Approve — the requester can't approve their own request."
+            ),
+            color=EMBED_COLOR,
+        )
+        embed.add_field(name="Old account", value=f"`{self.old_user_id}`", inline=False)
+        embed.add_field(name="Owns", value=sample, inline=False)
+        if self.snapshot["already_migrated"]:
+            embed.add_field(
+                name="⚠️ Already recovered",
+                value=(
+                    "onto Meta id "
+                    f"`{self.snapshot['already_migrated'].get('new_meta_user_id')}`"
+                ),
+                inline=False,
+            )
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            await interaction.response.send_message(
+                "You requested this — a different "
+                f"**{SUPA_MANAGER_ROLE_NAME}** has to approve it.",
+                ephemeral=True,
+            )
+            return False
+        member = interaction.user
+        has_role = isinstance(member, discord.Member) and any(
+            role.name == SUPA_MANAGER_ROLE_NAME for role in member.roles
+        )
+        if not has_role:
+            await interaction.response.send_message(
+                f"Only **{SUPA_MANAGER_ROLE_NAME}** can approve this.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
+    async def approve(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.resolved = True
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"⏳ Approved by {interaction.user} — moving the account now...",
+            embed=None, view=None,
+        )
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            result = await supa_admin.recover_account(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                old_user_id=self.old_user_id, new_meta_user_id=self.new_meta_id,
+                staff=str(interaction.user),
+            )
+        except supa_admin.SupaError as error:
+            # claim_execute refuses rather than half-doing it, and every step
+            # rolls itself back, so nobody is stranded when this happens.
+            await interaction.edit_original_response(
+                content=(
+                    f"❌ Recovery didn't go through — **nothing was changed**.\n`{error}`"
+                ),
+            )
+            logger.info(
+                "Recovery approval failed: %s -> Meta id %s (requested by <@%s>, "
+                "approved by %s): %s",
+                self.old_user_id, self.new_meta_id, self.requester_id,
+                interaction.user, error,
+            )
+            return
+
+        embed = discord.Embed(
+            title="🎒 Account recovered",
+            description=(
+                f"**{self.snapshot['item_count']}** cosmetics and "
+                f"**{self.snapshot['balance']}** {CURRENCY_NAME} are now on Meta id "
+                f"`{self.new_meta_id}`."
+            ),
+            color=EMBED_COLOR,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Old account", value=f"`{self.old_user_id}`", inline=False)
+        embed.add_field(
+            name="Previous Meta id",
+            value=f"`{result.get('old_meta_user_id') or 'unknown'}`",
+            inline=False,
+        )
+        embed.add_field(
+            name="Tell the player",
+            value=(
+                "**Fully close the game and open it again.** Their cosmetics "
+                "will be there when it loads."
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text=f"Requested by {self.requester_id}, approved by {interaction.user}"
+        )
+        await interaction.edit_original_response(content=None, embed=embed)
+        logger.info(
+            "Recovered %s onto Meta id %s (requested by <@%s>, approved by %s)",
+            self.old_user_id, self.new_meta_id, self.requester_id, interaction.user,
+        )
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
+    async def deny(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.resolved = True
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"❌ Denied by {interaction.user}. Nothing was changed.",
+            embed=None, view=None,
+        )
+        logger.info(
+            "Recovery request denied: %s -> Meta id %s (requested by <@%s>, denied by %s)",
+            self.old_user_id, self.new_meta_id, self.requester_id, interaction.user,
+        )
+
+    async def on_timeout(self) -> None:
+        if self.resolved or self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=(
+                    "⏳ This request expired with no approval. Run "
+                    "`/recover-account` again."
+                ),
+                embed=None, view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+
 # Alphabet with I, O, 0, 1 and L removed: this gets typed on a VR keyboard and
 # read back off a Discord message, so confusable glyphs cost support tickets.
 _TOKEN_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
@@ -1305,7 +1467,7 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     @tree.command(
         name="recover-account",
-        description="Put a player's old account back on their new Meta id.",
+        description="Request putting a player's old account back on their new Meta id.",
     )
     @app_commands.describe(
         old_user_id="The old account's player UUID (from /recover-lookup)",
@@ -1315,6 +1477,11 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     async def recover_account_command(
         interaction: discord.Interaction, old_user_id: str, new_meta_id: str
     ) -> None:
+        # This only STAGES the request now. A DIFFERENT Supa Manager has to
+        # press Approve on the message this posts (RecoverApprovalView, above)
+        # before supa_admin.recover_account ever runs. Run it inside the
+        # player's open recovery ticket so the approval sits next to the proof
+        # they already posted there.
         await interaction.response.defer()
         if not await _ensure_service_key(interaction):
             return
@@ -1331,47 +1498,26 @@ def register_commands(tree: app_commands.CommandTree) -> None:
             snap = await supa_admin.account_snapshot(
                 client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
             )
-            result = await supa_admin.recover_account(
-                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-                old_user_id=uid, new_meta_user_id=meta_id,
-                staff=str(interaction.user),
-            )
         except supa_admin.SupaError as error:
-            # claim_execute refuses rather than half-doing it, and every step
-            # rolls itself back, so nobody is stranded when this happens.
-            await interaction.followup.send(
-                f"❌ Recovery didn't go through — **nothing was changed**.\n`{error}`"
-            )
+            await interaction.followup.send(f"Couldn't look up that account.\n`{error}`")
             return
 
-        embed = discord.Embed(
-            title="🎒 Account recovered",
-            description=(
-                f"**{snap['item_count']}** cosmetics and **{snap['balance']}** "
-                f"{CURRENCY_NAME} are now on Meta id `{meta_id}`."
-            ),
-            color=EMBED_COLOR,
-            timestamp=datetime.now(timezone.utc),
+        view = RecoverApprovalView(
+            requester_id=interaction.user.id, old_user_id=uid, new_meta_id=meta_id,
+            snapshot=snap,
         )
-        embed.add_field(name="Old account", value=f"`{uid}`", inline=False)
-        embed.add_field(
-            name="Previous Meta id",
-            value=f"`{result.get('old_meta_user_id') or 'unknown'}`",
-            inline=False,
+        view.message = await interaction.followup.send(
+            content=f"Requested by {interaction.user.mention}.",
+            embed=view.request_embed(),
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+            wait=True,
         )
-        embed.add_field(
-            name="Tell the player",
-            value=(
-                "**Fully close the game and open it again.** Their cosmetics "
-                "will be there when it loads."
-            ),
-            inline=False,
+        logger.info(
+            "Recovery requested: %s -> Meta id %s (by %s, awaiting a different "
+            "Supa Manager's approval)",
+            uid, meta_id, interaction.user,
         )
-        embed.set_footer(text=f"Recovered by {interaction.user}")
-        await interaction.followup.send(
-            embed=embed, allowed_mentions=discord.AllowedMentions.none()
-        )
-        logger.info("Recovered %s onto Meta id %s (by %s)", uid, meta_id, interaction.user)
 
     @tree.command(
         name="recover-undo",
