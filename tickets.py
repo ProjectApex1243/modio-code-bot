@@ -15,6 +15,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Awaitable, Callable
 
 import discord
 
@@ -114,6 +115,12 @@ TICKET_KINDS = {
         "default_category_id": 1468743079371477093,
     },
 }
+
+# Populated by main.py at import time (main.py imports tickets, so this is
+# the only direction that can't be a plain import) so a ticket kind can post
+# extra staff controls right after opening - see open_staff_ticket below and
+# main.py's _post_recovery_controls.
+TICKET_OPENED_HOOKS: dict[str, Callable[[discord.TextChannel], Awaitable[None]]] = {}
 
 
 def cosmetic_items() -> list[str]:
@@ -483,6 +490,14 @@ async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None
         view=TicketCloseView(),
         allowed_mentions=discord.AllowedMentions.none(),
     )
+
+    hook = TICKET_OPENED_HOOKS.get(kind)
+    if hook is not None:
+        try:
+            await hook(channel)
+        except discord.HTTPException:
+            logger.exception("Post-open hook for %s ticket failed", kind)
+
     await interaction.followup.send(
         f"Opened your ticket: {channel.mention}", ephemeral=True
     )

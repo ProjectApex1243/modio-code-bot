@@ -100,9 +100,15 @@ class RoomBot(discord.Client):
         # Must happen before the gateway connects, or ticket buttons posted
         # before the last restart come back dead.
         tickets.register_persistent_views(self)
+        # Lives in main.py, not tickets.PERSISTENT_VIEWS, because it needs
+        # Supabase helpers that only main.py imports - see RecoveryControlsView.
+        self.add_view(RecoveryControlsView())
         logger.info(
-            "Ticket buttons registered (%s). Reward items: %s",
+            "Ticket buttons registered (%s, %s). Reward items: %s",
             ", ".join(tickets.registered_custom_ids()),
+            ", ".join(
+                str(child.custom_id) for child in RecoveryControlsView().children
+            ),
             ", ".join(tickets.cosmetic_items()),
         )
         await tickets.self_test(self.http_session)
@@ -220,11 +226,7 @@ class RecoverApprovalView(discord.ui.View):
                 ephemeral=True,
             )
             return False
-        member = interaction.user
-        has_role = isinstance(member, discord.Member) and any(
-            role.name == SUPA_MANAGER_ROLE_NAME for role in member.roles
-        )
-        if not has_role:
+        if not _has_role(interaction.user, SUPA_MANAGER_ROLE_NAME):
             await interaction.response.send_message(
                 f"Only **{SUPA_MANAGER_ROLE_NAME}** can approve this.", ephemeral=True
             )
@@ -319,13 +321,364 @@ class RecoverApprovalView(discord.ui.View):
         try:
             await self.message.edit(
                 content=(
-                    "⏳ This request expired with no approval. Run "
-                    "`/recover-account` again."
+                    "⏳ This request expired with no approval. Press "
+                    "**Request recovery** again in the ticket."
                 ),
                 embed=None, view=None,
             )
         except discord.HTTPException:
             pass
+
+
+def _has_role(user: discord.abc.User, role_name: str) -> bool:
+    """True if `user` is a guild Member holding a role named `role_name`."""
+    return isinstance(user, discord.Member) and any(
+        role.name == role_name for role in user.roles
+    )
+
+
+def _lookup_candidates_embed(
+    name: str, matches: list[dict], snapshots: dict[str, dict]
+) -> discord.Embed:
+    """The candidate list /recover-lookup used to print, shared with the
+    in-ticket "Look up account" button below."""
+    embed = discord.Embed(
+        title="🎒 Account recovery — candidates",
+        description=(
+            f"**{len(matches)}** account(s) named "
+            f"**{discord.utils.escape_markdown(name)}**.\n"
+            "Names are not unique, so confirm with the cosmetics and rock "
+            "count before picking one."
+        ),
+        color=EMBED_COLOR,
+    )
+    for row in matches[:5]:
+        uid = str(row.get("user_id"))
+        snap = snapshots.get(uid)
+        if snap is None:
+            embed.add_field(name=f"`{uid}`", value="(couldn't read details)", inline=False)
+            continue
+        sample = ", ".join(_item_label(i) for i in snap["items"][:6]) or "nothing"
+        lines = [
+            f"**{snap['item_count']}** cosmetics · **{snap['balance']}** {CURRENCY_NAME}",
+            f"Owns: {sample}",
+            f"Meta id: `{snap['meta_user_id'] or 'unknown'}`",
+        ]
+        seen = _parse_timestamp(snap.get("last_seen"))
+        if seen is not None:
+            lines.append(f"Last login: <t:{int(seen.timestamp())}:R>")
+        if snap["already_migrated"]:
+            lines.append(
+                "⚠️ **Already recovered** onto Meta id "
+                f"`{snap['already_migrated'].get('new_meta_user_id')}`"
+            )
+        embed.add_field(name=f"`{uid}`", value="\n".join(lines), inline=False)
+    if len(matches) > 5:
+        embed.set_footer(text=f"+{len(matches) - 5} more not shown")
+    return embed
+
+
+class RecoverRequestPromptView(discord.ui.View):
+    """Ephemeral: one button that opens the "new Meta id" modal pre-filled
+    with the account just picked out of RecoverCandidatePickView."""
+
+    def __init__(self, *, old_user_id: str) -> None:
+        super().__init__(timeout=300)
+        self.old_user_id = old_user_id
+
+    @discord.ui.button(label="Request recovery", emoji="📨", style=discord.ButtonStyle.success)
+    async def request(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not _has_role(interaction.user, SUPA_MANAGER_ROLE_NAME):
+            await interaction.response.send_message(
+                f"Only **{SUPA_MANAGER_ROLE_NAME}** can request a recovery.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(RecoverRequestModal(old_user_id=self.old_user_id))
+
+
+class RecoverCandidatePickView(discord.ui.View):
+    """Ephemeral: lets the staff member who ran the lookup pick which of the
+    (possibly several, same-named) accounts is the right one."""
+
+    def __init__(self, *, snapshots: dict[str, dict]) -> None:
+        super().__init__(timeout=300)
+        self.snapshots = snapshots
+        self.select = discord.ui.Select(
+            placeholder="Pick the right account",
+            options=[
+                discord.SelectOption(
+                    label=(
+                        f"{uid} — {snap['item_count']} items, "
+                        f"{snap['balance']} {CURRENCY_NAME}"
+                    )[:100],
+                    value=uid,
+                    description=(
+                        f"Meta id {snap['meta_user_id']}"
+                        if snap["meta_user_id"]
+                        else "no Meta id on file"
+                    )[:100],
+                )
+                for uid, snap in snapshots.items()
+            ],
+        )
+        self.select.callback = self._on_pick
+        self.add_item(self.select)
+
+    async def _on_pick(self, interaction: discord.Interaction) -> None:
+        uid = self.select.values[0]
+        snap = self.snapshots[uid]
+        sample = ", ".join(_item_label(i) for i in snap["items"][:6]) or "nothing"
+        embed = discord.Embed(
+            title=f"🎒 `{uid}`",
+            description="Confirmed the right account? Request the recovery below.",
+            color=EMBED_COLOR,
+        )
+        embed.add_field(
+            name="Details",
+            value=(
+                f"**{snap['item_count']}** cosmetics · **{snap['balance']}** "
+                f"{CURRENCY_NAME}\nOwns: {sample}\n"
+                f"Meta id: `{snap['meta_user_id'] or 'unknown'}`"
+            ),
+            inline=False,
+        )
+        if snap["already_migrated"]:
+            embed.add_field(
+                name="⚠️ Already recovered",
+                value=f"onto Meta id `{snap['already_migrated'].get('new_meta_user_id')}`",
+                inline=False,
+            )
+        await interaction.response.edit_message(
+            embed=embed, view=RecoverRequestPromptView(old_user_id=uid)
+        )
+
+
+class RecoverLookupModal(discord.ui.Modal, title="Look up an old account"):
+    old_name_input = discord.ui.TextInput(
+        label="Old in-game name", placeholder="Spelled exactly as it was", max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Ephemeral start to finish: another same-named account's cosmetics,
+        # balance and Meta id would otherwise leak to whoever opened this
+        # ticket, since it's a channel they can read too.
+        await interaction.response.defer(ephemeral=True)
+        if not SUPABASE_SERVICE_ROLE_KEY:
+            await interaction.followup.send(
+                "`SUPABASE_SERVICE_ROLE_KEY` is not set on the bot, so it can't "
+                "touch these tables. Add it to the environment and restart.",
+                ephemeral=True,
+            )
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+        name = self.old_name_input.value
+
+        try:
+            matches = await supa_admin.find_accounts_by_name(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, name
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+
+        if not matches:
+            await interaction.followup.send(
+                f"No account found with the name **{discord.utils.escape_markdown(name)}**. "
+                "Names are matched exactly (case doesn't matter) — check the spelling.",
+                ephemeral=True,
+            )
+            return
+
+        snapshots: dict[str, dict] = {}
+        for row in matches[:5]:
+            uid = str(row.get("user_id"))
+            try:
+                snapshots[uid] = await supa_admin.account_snapshot(
+                    client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+                )
+            except supa_admin.SupaError:
+                logger.exception("Snapshot failed for %s", uid)
+
+        embed = _lookup_candidates_embed(name, matches, snapshots)
+        view = RecoverCandidatePickView(snapshots=snapshots) if snapshots else None
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+class RecoverRequestModal(discord.ui.Modal, title="Request account recovery"):
+    """Stages a recovery exactly like /recover-account used to: posts a
+    RecoverApprovalView that a DIFFERENT Supa Manager has to approve."""
+
+    old_user_id_input = discord.ui.TextInput(
+        label="Old account UUID", placeholder="from Look up account", max_length=64,
+    )
+    new_meta_id_input = discord.ui.TextInput(
+        label="New Meta user id",
+        placeholder="digits only, e.g. 1022123670773651",
+        max_length=32,
+    )
+
+    def __init__(self, *, old_user_id: str | None = None) -> None:
+        super().__init__()
+        if old_user_id:
+            self.old_user_id_input.default = old_user_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            uid = supa_admin.validate_user_id(self.old_user_id_input.value)
+            meta_id = supa_admin.validate_meta_id(self.new_meta_id_input.value)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        try:
+            snap = await supa_admin.account_snapshot(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(f"Couldn't look up that account.\n`{error}`")
+            return
+
+        view = RecoverApprovalView(
+            requester_id=interaction.user.id, old_user_id=uid, new_meta_id=meta_id,
+            snapshot=snap,
+        )
+        view.message = await interaction.followup.send(
+            content=f"Requested by {interaction.user.mention}.",
+            embed=view.request_embed(),
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+            wait=True,
+        )
+        logger.info(
+            "Recovery requested: %s -> Meta id %s (by %s, awaiting a different "
+            "Supa Manager's approval)",
+            uid, meta_id, interaction.user,
+        )
+
+
+class RecoverUndoModal(discord.ui.Modal, title="Undo a recovery"):
+    new_meta_id_input = discord.ui.TextInput(
+        label="Meta id the account was moved onto", max_length=32,
+    )
+    reason_input = discord.ui.TextInput(
+        label="Reason", style=discord.TextStyle.paragraph, max_length=300,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            meta_id = supa_admin.validate_meta_id(self.new_meta_id_input.value)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        try:
+            result = await supa_admin.revert_recovery(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                new_meta_user_id=meta_id,
+                reason=f"{self.reason_input.value} (by {interaction.user})",
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(f"❌ Couldn't undo it.\n`{error}`")
+            return
+
+        await interaction.followup.send(
+            f"✅ Undone. Account `{result.get('old_user_id')}` is back on its "
+            "original Meta id and can be recovered again.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        logger.info("Reverted recovery for Meta id %s (by %s)", meta_id, interaction.user)
+
+
+class RecoveryControlsView(discord.ui.View):
+    """Posted automatically in every "recover" ticket (see
+    _post_recovery_controls / tickets.TICKET_OPENED_HOOKS). Replaces
+    /recover-lookup, /recover-account and /recover-undo with buttons so staff
+    never have to leave the ticket to type a command."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item,
+    ) -> None:
+        label = getattr(item, "custom_id", None) or type(item).__name__
+        logger.exception("Recovery control %s failed", label, exc_info=error)
+        message = "Something broke on our end. Please tell a developer."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            logger.exception("Could not even report the failure for %s", label)
+
+    @discord.ui.button(
+        label="Look up account", emoji="🔍",
+        style=discord.ButtonStyle.primary, custom_id="ticket:recover:lookup",
+    )
+    async def lookup(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _has_role(interaction.user, STAFF_ROLE_NAME):
+            await interaction.response.send_message(
+                f"Only **{STAFF_ROLE_NAME}** can do this.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(RecoverLookupModal())
+
+    @discord.ui.button(
+        label="Request recovery", emoji="📨",
+        style=discord.ButtonStyle.success, custom_id="ticket:recover:request",
+    )
+    async def request(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _has_role(interaction.user, SUPA_MANAGER_ROLE_NAME):
+            await interaction.response.send_message(
+                f"Only **{SUPA_MANAGER_ROLE_NAME}** can do this.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(RecoverRequestModal())
+
+    @discord.ui.button(
+        label="Undo a recovery", emoji="↩️",
+        style=discord.ButtonStyle.danger, custom_id="ticket:recover:undo",
+    )
+    async def undo(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not _has_role(interaction.user, SUPA_MANAGER_ROLE_NAME):
+            await interaction.response.send_message(
+                f"Only **{SUPA_MANAGER_ROLE_NAME}** can do this.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(RecoverUndoModal())
+
+
+async def _post_recovery_controls(channel: discord.TextChannel) -> None:
+    """Hooked into tickets.TICKET_OPENED_HOOKS["recover"] so tickets.py can
+    post this without importing main.py (it defines the reverse import)."""
+    await channel.send(
+        embed=discord.Embed(
+            title="Staff controls",
+            description=(
+                "Use these instead of typing a command — they replace "
+                "`/recover-lookup`, `/recover-account` and `/recover-undo`."
+            ),
+            color=EMBED_COLOR,
+        ),
+        view=RecoveryControlsView(),
+    )
+
+
+tickets.TICKET_OPENED_HOOKS["recover"] = _post_recovery_controls
 
 
 # Alphabet with I, O, 0, 1 and L removed: this gets typed on a VR keyboard and
@@ -1388,175 +1741,14 @@ def register_commands(tree: app_commands.CommandTree) -> None:
 
     # --- Account recovery (App Lab move) -------------------------------------
     # Meta gives every app a different id for the same person, so a player on
-    # the new build looks like a stranger. Nothing was lost - these commands
-    # repoint the new Meta id at the account that already exists.
-
-    @tree.command(
-        name="recover-lookup",
-        description="Find a player's old account by their in-game name.",
-    )
-    @app_commands.describe(name="The player's old in-game name, spelled as it was")
-    @app_commands.checks.has_role(STAFF_ROLE_NAME)
-    async def recover_lookup(interaction: discord.Interaction, name: str) -> None:
-        await interaction.response.defer()
-        if not await _ensure_service_key(interaction):
-            return
-        client: RoomBot = interaction.client  # type: ignore[assignment]
-
-        try:
-            matches = await supa_admin.find_accounts_by_name(
-                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, name
-            )
-        except supa_admin.SupaError as error:
-            await interaction.followup.send(str(error))
-            return
-
-        if not matches:
-            await interaction.followup.send(
-                f"No account found with the name **{discord.utils.escape_markdown(name)}**. "
-                "Names are matched exactly (case doesn't matter) — ask them to "
-                "check the spelling."
-            )
-            return
-
-        embed = discord.Embed(
-            title="🎒 Account recovery — candidates",
-            description=(
-                f"**{len(matches)}** account(s) named "
-                f"**{discord.utils.escape_markdown(name)}**.\n"
-                "Names are not unique, so confirm with the cosmetics and rock "
-                "count before running `/recover-account`."
-            ),
-            color=EMBED_COLOR,
-        )
-
-        # Snapshots are four REST calls each, so only the first few are detailed.
-        for row in matches[:5]:
-            uid = str(row.get("user_id"))
-            try:
-                snap = await supa_admin.account_snapshot(
-                    client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
-                )
-            except supa_admin.SupaError:
-                logger.exception("Snapshot failed for %s", uid)
-                embed.add_field(name=f"`{uid}`", value="(couldn't read details)", inline=False)
-                continue
-
-            sample = ", ".join(_item_label(i) for i in snap["items"][:6]) or "nothing"
-            lines = [
-                f"**{snap['item_count']}** cosmetics · **{snap['balance']}** {CURRENCY_NAME}",
-                f"Owns: {sample}",
-                f"Meta id: `{snap['meta_user_id'] or 'unknown'}`",
-            ]
-            seen = _parse_timestamp(snap.get("last_seen"))
-            if seen is not None:
-                lines.append(f"Last login: <t:{int(seen.timestamp())}:R>")
-            if snap["already_migrated"]:
-                lines.append(
-                    "⚠️ **Already recovered** onto Meta id "
-                    f"`{snap['already_migrated'].get('new_meta_user_id')}`"
-                )
-            embed.add_field(name=f"`{uid}`", value="\n".join(lines), inline=False)
-
-        if len(matches) > 5:
-            embed.set_footer(text=f"+{len(matches) - 5} more not shown")
-
-        await interaction.followup.send(
-            embed=embed, allowed_mentions=discord.AllowedMentions.none()
-        )
-
-    @tree.command(
-        name="recover-account",
-        description="Request putting a player's old account back on their new Meta id.",
-    )
-    @app_commands.describe(
-        old_user_id="The old account's player UUID (from /recover-lookup)",
-        new_meta_id="Their Meta user id on the new app (digits only)",
-    )
-    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
-    async def recover_account_command(
-        interaction: discord.Interaction, old_user_id: str, new_meta_id: str
-    ) -> None:
-        # This only STAGES the request now. A DIFFERENT Supa Manager has to
-        # press Approve on the message this posts (RecoverApprovalView, above)
-        # before supa_admin.recover_account ever runs. Run it inside the
-        # player's open recovery ticket so the approval sits next to the proof
-        # they already posted there.
-        await interaction.response.defer()
-        if not await _ensure_service_key(interaction):
-            return
-        client: RoomBot = interaction.client  # type: ignore[assignment]
-
-        try:
-            uid = supa_admin.validate_user_id(old_user_id)
-            meta_id = supa_admin.validate_meta_id(new_meta_id)
-        except ValueError as error:
-            await interaction.followup.send(str(error))
-            return
-
-        try:
-            snap = await supa_admin.account_snapshot(
-                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
-            )
-        except supa_admin.SupaError as error:
-            await interaction.followup.send(f"Couldn't look up that account.\n`{error}`")
-            return
-
-        view = RecoverApprovalView(
-            requester_id=interaction.user.id, old_user_id=uid, new_meta_id=meta_id,
-            snapshot=snap,
-        )
-        view.message = await interaction.followup.send(
-            content=f"Requested by {interaction.user.mention}.",
-            embed=view.request_embed(),
-            view=view,
-            allowed_mentions=discord.AllowedMentions.none(),
-            wait=True,
-        )
-        logger.info(
-            "Recovery requested: %s -> Meta id %s (by %s, awaiting a different "
-            "Supa Manager's approval)",
-            uid, meta_id, interaction.user,
-        )
-
-    @tree.command(
-        name="recover-undo",
-        description="Undo a recovery that went to the wrong person.",
-    )
-    @app_commands.describe(
-        new_meta_id="The Meta id the account was moved onto",
-        reason="Why it's being undone",
-    )
-    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
-    async def recover_undo(
-        interaction: discord.Interaction, new_meta_id: str, reason: str
-    ) -> None:
-        await interaction.response.defer()
-        if not await _ensure_service_key(interaction):
-            return
-        client: RoomBot = interaction.client  # type: ignore[assignment]
-
-        try:
-            meta_id = supa_admin.validate_meta_id(new_meta_id)
-        except ValueError as error:
-            await interaction.followup.send(str(error))
-            return
-
-        try:
-            result = await supa_admin.revert_recovery(
-                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
-                new_meta_user_id=meta_id, reason=f"{reason} (by {interaction.user})",
-            )
-        except supa_admin.SupaError as error:
-            await interaction.followup.send(f"❌ Couldn't undo it.\n`{error}`")
-            return
-
-        await interaction.followup.send(
-            f"✅ Undone. Account `{result.get('old_user_id')}` is back on its "
-            "original Meta id and can be recovered again.",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        logger.info("Reverted recovery for Meta id %s (by %s)", meta_id, interaction.user)
+    # the new build looks like a stranger. Nothing was lost - the account
+    # still exists, it just needs relinking.
+    #
+    # Staff-side lookup/request/undo used to be three commands here
+    # (/recover-lookup, /recover-account, /recover-undo). They're now buttons
+    # instead (RecoverLookupModal, RecoverRequestModal, RecoverUndoModal,
+    # RecoveryControlsView, above), posted automatically in every "recover"
+    # ticket via tickets.TICKET_OPENED_HOOKS - see _post_recovery_controls.
 
     @tree.command(
         name="recover",
