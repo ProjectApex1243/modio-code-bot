@@ -168,6 +168,65 @@ def _category_id_for(kind: str) -> int | None:
     return None
 
 
+# Discord's hard cap on channels in one category. Not configurable, and the
+# 51st is refused with a 400 that no amount of waiting clears.
+MAX_CHANNELS_PER_CATEGORY = 50
+
+
+def _overflow_index(name: str, base: str) -> int:
+    """0 for the original category, N for an "<base> N" overflow."""
+    match = re.fullmatch(rf"{re.escape(base)}\s+(\d+)", name)
+    return int(match.group(1)) if match else 0
+
+
+async def _category_with_room(
+    guild: discord.Guild, category: discord.CategoryChannel | None, reason: str
+) -> discord.CategoryChannel | None:
+    """`category`, or an overflow beside it once it holds 50 channels.
+
+    A full ticket category used to end the flow on a raw "Maximum number of
+    channels in category reached (50)", reported to the player as "try again
+    in a moment" — advice that could never work, because nothing frees a slot
+    except staff closing tickets.
+
+    Overflows are named "<original> 2", "3", ... and copy the original's
+    permission overwrites, so a ticket that lands in one is exactly as private
+    as it would have been. Returning None puts the channel at the guild root;
+    it still carries its own overwrites, so it is private either way, and a
+    ticket in an ugly place beats no ticket at all.
+    """
+    if category is None or len(category.channels) < MAX_CHANNELS_PER_CATEGORY:
+        return category
+
+    base = re.sub(r"\s+\d+$", "", category.name)
+    siblings = [
+        existing for existing in guild.categories
+        if existing.name == base
+        or re.fullmatch(rf"{re.escape(base)}\s+\d+", existing.name)
+    ]
+    for sibling in sorted(siblings, key=lambda c: _overflow_index(c.name, base)):
+        if len(sibling.channels) < MAX_CHANNELS_PER_CATEGORY:
+            return sibling
+
+    # The original counts as index 0, so the first overflow is 2, not 1.
+    next_index = max(2, max(_overflow_index(c.name, base) for c in siblings) + 1)
+    try:
+        created = await guild.create_category(
+            name=f"{base} {next_index}",
+            overwrites=dict(category.overwrites),
+            reason=reason,
+        )
+    except discord.HTTPException:
+        logger.exception("Could not add an overflow category next to %s", category.name)
+        return None
+
+    logger.info(
+        "%s was full (%d channels); overflowed into %s",
+        category.name, MAX_CHANNELS_PER_CATEGORY, created.name,
+    )
+    return created
+
+
 def help_menu_embed() -> discord.Embed:
     """The 'what do you need help with?' screen, shown on the panel itself.
 
@@ -429,6 +488,10 @@ async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None
         # Fall back to wherever the panel lives, so tickets stay near it.
         category = interaction.channel.category
 
+    category = await _category_with_room(
+        guild, category, reason=f"{TICKET_KINDS[kind]['label']} tickets overflowed"
+    )
+
     staff_role = discord.utils.get(guild.roles, name=STAFF_ROLE_NAME)
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -462,10 +525,15 @@ async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None
             ephemeral=True,
         )
         return
-    except discord.HTTPException:
+    except discord.HTTPException as error:
         logger.exception("Creating a %s ticket failed for %s", kind, interaction.user)
+        # Deliberately not "try again in a moment": the usual cause is the
+        # server being out of channel room, which only staff can clear.
         await interaction.followup.send(
-            "Couldn't open your ticket just now. Try again in a moment.",
+            "Couldn't open your ticket. The server may be out of room for new "
+            "channels, which staff have to clear — retrying won't fix that.\n"
+            "Please show a staff member this:\n"
+            f"```\n{describe_error(error)}\n```",
             ephemeral=True,
         )
         return
