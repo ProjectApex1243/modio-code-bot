@@ -19,6 +19,7 @@ from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
+import ocr
 import supa_admin
 import tickets
 from cosmetics import COSMETICS, display_name_for, image_path, search_cosmetics
@@ -1881,6 +1882,63 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         await interaction.followup.send(
             embed=embed, allowed_mentions=discord.AllowedMentions.none()
         )
+
+    @tree.context_menu(name="Read Player ID")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def read_player_id_context(
+        interaction: discord.Interaction, message: discord.Message
+    ) -> None:
+        # A right-click action rather than a slash command with an attachment
+        # option: the screenshot is already sitting in the ticket, so this
+        # reads it in place instead of making staff re-download and re-upload
+        # a copy just to hand it back to the bot.
+        await interaction.response.defer()
+        images = [
+            a for a in message.attachments if (a.content_type or "").startswith("image/")
+        ]
+        if not images:
+            await interaction.followup.send(
+                "That message doesn't have an image attached.", ephemeral=True
+            )
+            return
+
+        try:
+            data = await images[0].read()
+        except discord.HTTPException as error:
+            await interaction.followup.send(
+                f"Couldn't download that image.\n`{error}`", ephemeral=True
+            )
+            return
+
+        try:
+            uid, raw_text = await asyncio.to_thread(ocr.extract_player_id, data)
+        except ocr.OcrUnavailableError as error:
+            await interaction.followup.send(f"⚠️ {error}", ephemeral=True)
+            return
+        except Exception:
+            logger.exception(
+                "OCR failed on an attachment in %s (by %s)",
+                getattr(message.channel, "name", message.channel.id), interaction.user,
+            )
+            await interaction.followup.send(
+                "Something went wrong reading that image.", ephemeral=True
+            )
+            return
+
+        if uid is None:
+            await interaction.followup.send(
+                "Couldn't find anything shaped like a Player ID in that image.\n"
+                "Here's the raw text it read, in case it's just a formatting miss:\n"
+                "```\n" + (raw_text[:1500] or "(nothing)") + "\n```"
+            )
+            return
+
+        await interaction.followup.send(
+            f"🔎 Read Player ID: `{uid}`\n"
+            "-# Auto-read from the image — double-check against the screenshot "
+            "if this looks off."
+        )
+        logger.info("OCR read player id %s from an attachment (by %s)", uid, interaction.user)
 
     @tree.command(
         name="recover",
