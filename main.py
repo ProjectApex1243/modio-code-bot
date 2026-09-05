@@ -1832,10 +1832,55 @@ def register_commands(tree: app_commands.CommandTree) -> None:
     # still exists, it just needs relinking.
     #
     # Staff-side lookup/request/undo used to be three commands here
-    # (/recover-lookup, /recover-account, /recover-undo). They're now buttons
-    # instead (RecoverLookupModal, RecoverRequestModal, RecoverUndoModal,
-    # RecoveryControlsView, above), posted automatically in every "recover"
-    # ticket via tickets.TICKET_OPENED_HOOKS - see _post_recovery_controls.
+    # (/recover-lookup, /recover-account, /recover-undo). Request/undo are now
+    # buttons instead (RecoverRequestModal, RecoverUndoModal, RecoveryControlsView,
+    # above), posted automatically in every "recover" ticket via
+    # tickets.TICKET_OPENED_HOOKS - see _post_recovery_controls. Lookup is a
+    # standalone command again (below) since staff need it outside a recovery
+    # ticket too - e.g. telling apart two players who share a name before any
+    # other admin command.
+
+    @tree.command(
+        name="player-lookup",
+        description="Find a player's account(s) by their in-game name.",
+    )
+    @app_commands.describe(name="The player's in-game name, spelled as it was")
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def player_lookup_command(interaction: discord.Interaction, name: str) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            matches = await supa_admin.find_accounts_by_name(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, name
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+
+        if not matches:
+            await interaction.followup.send(
+                f"No account found with the name **{discord.utils.escape_markdown(name)}**. "
+                "Names are matched exactly (case doesn't matter) — check the spelling."
+            )
+            return
+
+        snapshots: dict[str, dict] = {}
+        for row in matches[:5]:
+            uid = str(row.get("user_id"))
+            try:
+                snapshots[uid] = await supa_admin.account_snapshot(
+                    client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, uid
+                )
+            except supa_admin.SupaError:
+                logger.exception("Snapshot failed for %s", uid)
+
+        embed = _lookup_candidates_embed(name, matches, snapshots)
+        await interaction.followup.send(
+            embed=embed, allowed_mentions=discord.AllowedMentions.none()
+        )
 
     @tree.command(
         name="recover",
