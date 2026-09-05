@@ -569,11 +569,6 @@ def validate_meta_id(raw: str) -> str:
     return cleaned
 
 
-def _quoted(value: str) -> str:
-    """PostgREST-safe quoted filter value; names contain spaces and commas."""
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
 async def rpc(session, supabase_url, key, function: str, payload: dict | None = None):
     """POST /rest/v1/rpc/<function>. Same auth and error handling as _rest."""
     return await _rest(
@@ -616,12 +611,17 @@ async def find_accounts_by_name(
 
     Names are not unique - only 17,119 of 38,633 are - so this returns every
     match and leaves the choosing to staff, who have the ticket in front of them.
+
+    The value is sent bare (aiohttp percent-encodes it, nothing more) - a
+    prior version wrapped it in PostgREST's list-style double quotes, which
+    isn't stripped for a plain filter like this and matched literally nothing,
+    ever, including the exact-name check /recover-finish depends on.
     """
     return await _rest(
         session, "GET", supabase_url, key, PROFILES_TABLE,
         params={
             "select": "user_id,display_name,created_at",
-            "display_name": f"ilike.{_quoted(display_name.strip())}",
+            "display_name": f"ilike.{display_name.strip()}",
             "limit": str(limit),
         },
     ) or []
@@ -798,7 +798,7 @@ async def find_account_by_exact_name(
         session, "GET", supabase_url, key, PROFILES_TABLE,
         params={
             "select": "user_id,display_name,created_at",
-            "display_name": f"ilike.{_quoted(display_name.strip())}",
+            "display_name": f"ilike.{display_name.strip()}",
             "created_at": f"gte.{cutoff}",
             "limit": "5",
         },
