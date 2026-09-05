@@ -2299,6 +2299,145 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
         await interaction.followup.send(embed=result)
 
+    @tree.command(
+        name="close-tickets",
+        description="Bulk-close ticket channels and delete them.",
+    )
+    @app_commands.describe(
+        kind="Which ticket type to close (blank = every type)",
+        inactive_days="Only close tickets with no messages for this many days (blank = all)",
+        preview="Just list what would be deleted, without deleting anything",
+    )
+    @app_commands.choices(kind=[
+        app_commands.Choice(name="Get your cosmetics back", value="recover"),
+        app_commands.Choice(name="Ban appeal", value="appeal"),
+        app_commands.Choice(name="Something else", value="other"),
+    ])
+    @app_commands.guild_only()
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def close_tickets_command(
+        interaction: discord.Interaction,
+        kind: app_commands.Choice[str] | None = None,
+        inactive_days: app_commands.Range[int, 0] | None = None,
+        preview: bool = False,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message(
+                "This command only works inside a server.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+
+        # Only channels carrying a ticket topic are touchable. That is what
+        # keeps the support panel's own channel - which sits in the same
+        # category - out of a bulk delete.
+        wanted = kind.value if kind else None
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=inactive_days)
+            if inactive_days
+            else None
+        )
+
+        doomed: list[tuple[discord.TextChannel, datetime]] = []
+        skipped_active = 0
+        for channel in guild.text_channels:
+            parsed = tickets.parse_ticket_topic(channel)
+            if parsed is None:
+                continue
+            ticket_kind, _opener_id = parsed
+            if wanted is not None and ticket_kind != wanted:
+                continue
+            # last_message_id rides along on the channel payload, so this
+            # costs no API calls for what may be dozens of channels.
+            last = (
+                discord.utils.snowflake_time(channel.last_message_id)
+                if channel.last_message_id
+                else channel.created_at
+            )
+            if cutoff and last > cutoff:
+                skipped_active += 1
+                continue
+            doomed.append((channel, last))
+
+        label = f"**{kind.name}**" if kind else "all types"
+        if not doomed:
+            note = f" ({skipped_active} still active)" if skipped_active else ""
+            await interaction.followup.send(
+                f"No ticket channels to close for {label}{note}."
+            )
+            return
+
+        doomed.sort(key=lambda pair: pair[1])
+        listing = "\n".join(
+            f"{c.mention} — last message <t:{int(last.timestamp())}:R>"
+            for c, last in doomed[:15]
+        )
+        if len(doomed) > 15:
+            listing += f"\n…and {len(doomed) - 15} more"
+        # A day is the line between "abandoned" and "someone is mid-conversation".
+        day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+        recent = sum(1 for _c, last in doomed if last > day_ago)
+
+        if preview:
+            await interaction.followup.send(
+                f"**Preview only — nothing was deleted.**\n"
+                f"**{len(doomed)}** ticket(s) for {label} would be deleted:\n{listing}"
+                + (f"\n\n⚠️ **{recent}** had a message in the last 24h." if recent else "")
+            )
+            return
+
+        confirm_embed = discord.Embed(
+            title="⚠️ Confirm ticket wipe",
+            description=(
+                f"This deletes **{len(doomed)}** ticket channel(s) for {label} "
+                "and **everything written in them**, including any proof players "
+                "posted for a recovery. It cannot be undone.\n\n" + listing
+                + (f"\n\n⚠️ **{recent}** had a message in the last 24h — someone "
+                   "may still be mid-conversation." if recent else "")
+            ),
+            color=EMBED_RED,
+        )
+        view = ConfirmView(interaction.user.id, "Delete them", "Deleting…")
+        await interaction.followup.send(embed=confirm_embed, view=view)
+
+        if await view.wait():
+            await interaction.followup.send("Timed out — nothing was deleted.", ephemeral=True)
+            return
+        if not view.confirmed:
+            # ConfirmView already replaced the message with "Cancelled."
+            return
+
+        reason = f"Bulk ticket close by {interaction.user} ({interaction.user.id})"
+        deleted = 0
+        failed = 0
+        for index, (channel, _last) in enumerate(doomed):
+            try:
+                await channel.delete(reason=reason)
+                deleted += 1
+            except discord.HTTPException as error:
+                failed += 1
+                logger.warning("Could not delete ticket %s: %s", channel, error)
+            if deleted and deleted % 25 == 0:
+                await interaction.followup.send(
+                    f"…{deleted}/{len(doomed)} deleted so far.", ephemeral=True
+                )
+            if index < len(doomed) - 1:
+                await asyncio.sleep(PRUNE_KICK_DELAY)
+
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="🧹 Tickets closed",
+                description=f"Deleted **{deleted}** ticket channel(s)."
+                + (f"\n⚠️ **{failed}** could not be deleted (see bot logs)." if failed else ""),
+                color=EMBED_COLOR if not failed else EMBED_RED,
+            )
+        )
+        logger.info(
+            "Bulk-closed %d ticket(s) (kind=%s, inactive_days=%s) by %s",
+            deleted, wanted or "all", inactive_days, interaction.user,
+        )
+
     @lookup.autocomplete("cosmetic")
     async def lookup_autocomplete(
         interaction: discord.Interaction, current: str

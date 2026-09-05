@@ -426,6 +426,19 @@ def _channel_topic(kind: str, user_id: int) -> str:
     return f"{TOPIC_PREFIX} • {kind} • {user_id}"
 
 
+def parse_ticket_topic(channel: object) -> tuple[str, int] | None:
+    """(kind, opener id) for a ticket channel, None for anything else.
+
+    The None is the safety gate for bulk operations: the support panel's own
+    channel lives in the same category as the tickets and has no ticket topic,
+    so anything working off this can't sweep it up.
+    """
+    match = _TOPIC_RE.search(getattr(channel, "topic", "") or "")
+    if match is None:
+        return None
+    return match["kind"], int(match["user_id"])
+
+
 def find_open_ticket(
     guild: discord.Guild, user_id: int, kind: str
 ) -> discord.TextChannel | None:
