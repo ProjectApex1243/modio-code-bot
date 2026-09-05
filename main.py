@@ -1560,6 +1560,93 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
 
     @tree.command(
+        name="transfer-cosmetics",
+        description="Move every cosmetic from one player onto another.",
+    )
+    @app_commands.describe(
+        old_user_id="Player UUID to move cosmetics FROM (ends up with none)",
+        new_user_id="Player UUID to move cosmetics TO",
+    )
+    @app_commands.checks.has_role(SUPA_MANAGER_ROLE_NAME)
+    async def transfer_cosmetics_command(
+        interaction: discord.Interaction, old_user_id: str, new_user_id: str
+    ) -> None:
+        await interaction.response.defer()
+        if not await _ensure_service_key(interaction):
+            return
+        client: RoomBot = interaction.client  # type: ignore[assignment]
+
+        try:
+            old_uid = supa_admin.validate_user_id(old_user_id)
+            new_uid = supa_admin.validate_user_id(new_user_id)
+        except ValueError as error:
+            await interaction.followup.send(str(error))
+            return
+        if old_uid == new_uid:
+            await interaction.followup.send("Those are the same account — nothing to transfer.")
+            return
+
+        try:
+            owned = await supa_admin.fetch_inventory(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, old_uid
+            )
+            new_owned = await supa_admin.fetch_inventory(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, new_uid
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(str(error))
+            return
+        if not owned:
+            await interaction.followup.send(f"`{old_uid}` owns no cosmetics — nothing to transfer.")
+            return
+
+        overlap = len(set(owned) & set(new_owned))
+        confirm_embed = discord.Embed(
+            title="⚠️ Confirm cosmetics transfer",
+            description=(
+                f"Move **{len(owned)}** cosmetic(s) from `{old_uid}` onto `{new_uid}`.\n"
+                + (
+                    f"`{new_uid}` already owns **{overlap}** of them — those are kept "
+                    "as-is, not duplicated.\n"
+                    if overlap
+                    else ""
+                )
+                + f"`{old_uid}` will end up owning **none** of them. This cannot be undone."
+            ),
+            color=EMBED_RED,
+        )
+        view = ConfirmView(interaction.user.id, "Transfer", "Transferring…")
+        await interaction.followup.send(embed=confirm_embed, view=view)
+        if await view.wait():
+            await interaction.followup.send("Timed out — nothing was transferred.")
+            return
+        if not view.confirmed:
+            # ConfirmView already replaced the message with "Cancelled."
+            return
+
+        try:
+            granted, already_on_new = await supa_admin.transfer_cosmetics(
+                client.http_session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY,
+                old_user_id=old_uid, new_user_id=new_uid,
+            )
+        except supa_admin.SupaError as error:
+            await interaction.followup.send(
+                "❌ Something failed partway through — check both inventories by "
+                f"hand before trying again.\n`{error}`"
+            )
+            return
+
+        moved = len(granted) + len(already_on_new)
+        parts = [f"✅ Moved **{moved}** cosmetic(s) from `{old_uid}` to `{new_uid}`."]
+        if already_on_new:
+            parts.append(f"`{new_uid}` already owned **{len(already_on_new)}** of them.")
+        await interaction.followup.send("\n".join(parts))
+        logger.info(
+            "Transferred %s cosmetics from %s to %s (by %s)",
+            moved, old_uid, new_uid, interaction.user,
+        )
+
+    @tree.command(
         name="inventory",
         description="Show every cosmetic a player owns.",
     )

@@ -287,6 +287,28 @@ async def clear_inventory(session, supabase_url, key, user_id: str) -> int:
     return len(rows)
 
 
+async def transfer_cosmetics(
+    session, supabase_url, key, *, old_user_id: str, new_user_id: str
+) -> tuple[list[str], list[str]]:
+    """Moves every cosmetic old_user_id owns onto new_user_id.
+
+    Granted to the new account FIRST, removed from the old account second: if
+    a request fails partway through, the player ends up owning items on BOTH
+    accounts rather than neither. Returns (granted, already_on_new) - the
+    items new_user_id didn't already have, and the ones it did (those are
+    still removed from the old account, since the new one keeps them either
+    way).
+    """
+    item_ids = await fetch_inventory(session, supabase_url, key, old_user_id)
+    if not item_ids:
+        return [], []
+    granted, already_on_new = await grant_items(
+        session, supabase_url, key, new_user_id, item_ids
+    )
+    await remove_items(session, supabase_url, key, old_user_id, item_ids)
+    return granted, already_on_new
+
+
 async def fetch_catalog_item_ids(session, supabase_url, key) -> list[str]:
     """Item ids from the game catalog stored in title_data (key = 'catalog') —
     the source the GIVE EVERY COSMETIC query reads. The value column may hold
