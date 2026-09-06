@@ -753,12 +753,15 @@ class RecoverDetailsModal(discord.ui.Modal, title="Get your cosmetics back"):
             # Nothing carries that name. Say so now, while fixing it is free -
             # the alternative is a channel that sits there for a day before a
             # staff member types the same name in and finds the same nothing.
-            view = UnknownNameView(details, checked[1])
+            view = UnknownNameView(details)
             view.message = await interaction.followup.send(
                 content=(
-                    "**Your ticket hasn't been made yet.** Have a look at this "
-                    "first — if the name is wrong, fixing it now saves you the "
-                    "wait."
+                    "**Your ticket hasn't been made yet.** We can't find that "
+                    "name, and staff would only hit the same wall — so check "
+                    "the spelling and try again.\n\n"
+                    "If you're certain the name is right, open a "
+                    f"**{TICKET_KINDS['other']['label']}** ticket on the panel "
+                    "instead and staff will dig into it by hand."
                 ),
                 embed=checked[1],
                 view=view,
@@ -794,18 +797,22 @@ class RecoverDetailsModal(discord.ui.Modal, title="Get your cosmetics back"):
 class UnknownNameView(discord.ui.View):
     """Offered when the old name from the form matched no account.
 
-    Not a persistent view and deliberately without fixed custom_ids: it is
+    The only way on from here is a name that exists. Someone whose account
+    genuinely isn't in the profiles table - renamed, or never recorded - is
+    pointed at a "Something else" ticket instead, which is why this can insist
+    without stranding anyone.
+
+    Not a persistent view and deliberately without a fixed custom_id: it is
     sent ephemerally, and a registered custom_id on an ephemeral view is what
     kills the panel's buttons for everyone when the copy expires. See
     help_menu_embed for the full story.
     """
 
-    def __init__(self, details: dict[str, str], check_embed: discord.Embed) -> None:
+    def __init__(self, details: dict[str, str]) -> None:
         super().__init__(timeout=UNKNOWN_NAME_TIMEOUT)
         self.details = details
-        self.check_embed = check_embed
-        # Set by the caller so on_timeout can clear the buttons off the screen
-        # instead of leaving two that no longer do anything.
+        # Set by the caller so on_timeout can clear the button off the screen
+        # instead of leaving one that no longer does anything.
         self.message: discord.Message | None = None
 
     async def on_timeout(self) -> None:
@@ -815,7 +822,8 @@ class UnknownNameView(discord.ui.View):
             await self.message.edit(
                 content=(
                     "This timed out and **no ticket was made**. Press "
-                    "**Get your cosmetics back** on the panel to start again."
+                    f"**{TICKET_KINDS['recover']['label']}** on the panel to "
+                    "start again."
                 ),
                 embed=None,
                 view=None,
@@ -831,17 +839,6 @@ class UnknownNameView(discord.ui.View):
         # here even though the first one was already answered.
         await interaction.response.send_modal(RecoverDetailsModal(self.details))
         self.stop()
-
-    @discord.ui.button(
-        label="Open the ticket anyway", emoji="📨", style=discord.ButtonStyle.secondary
-    )
-    async def anyway(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        self.stop()
-        await open_staff_ticket(
-            interaction, "recover", details=self.details, extra_embed=self.check_embed
-        )
 
 
 async def start_recover_ticket(interaction: discord.Interaction) -> None:
