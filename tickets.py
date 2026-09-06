@@ -3,6 +3,8 @@
   • Discord cosmetics — fully automatic. Mints a personal single-use redemption
     code and hands it over on the spot. Limited to one per Discord account,
     forever, enforced by the primary key on discord_ticket_claims.
+  • Get your cosmetics back — asks for the old and new in-game names in a
+    form first, then opens a private channel with those answers already in it.
   • Ban appeal      — opens a private channel and pings staff.
   • Something else  — same, with a different label.
 
@@ -96,6 +98,18 @@ TICKET_KINDS = {
             "2. **Three cosmetics** you know you owned\n"
             "3. Roughly how many **shiny rocks** you had\n"
             "4. A screenshot of your old account if you have one\n\n"
+            "If you ever donated, say so — donors are easy for us to confirm."
+        ),
+        # Used instead of "intro" when the form was filled in first, so the
+        # channel doesn't ask again for what it already shows.
+        "intro_after_form": (
+            "Your cosmetics aren't lost — they're still on your old account. "
+            "Meta gives every app a different id for the same person, so the "
+            "new app doesn't recognise you yet. Staff can link the two.\n\n"
+            "**Your answers are above** — staff can start from those.\n\n"
+            "📷 If you have a **photo** of your old account or your new ID, "
+            "drag it into this channel now. It's the quickest way for us to be "
+            "sure it's you.\n"
             "If you ever donated, say so — donors are easy for us to confirm."
         ),
         "color": EMBED_BLURPLE,
@@ -255,7 +269,8 @@ def help_menu_embed() -> discord.Embed:
         value=(
             TICKET_KINDS["recover"]["blurb"]
             + "\n**Nothing was deleted** — your old account is still there.\n"
-            "Opens a private channel with staff."
+            "Asks for your old and new in-game names, then opens a private "
+            "channel with staff."
         ),
         inline=False,
     )
@@ -450,6 +465,26 @@ def find_open_ticket(
     return None
 
 
+def ticket_channels(
+    guild: discord.Guild, kind: str | None = None
+) -> list[tuple[discord.TextChannel, str, int]]:
+    """Every open ticket channel, as (channel, kind, opener_id).
+
+    Goes through parse_ticket_topic, so the same gate that keeps the panel's
+    own channel out of a bulk delete applies here too.
+    """
+    found: list[tuple[discord.TextChannel, str, int]] = []
+    for channel in guild.text_channels:
+        parsed = parse_ticket_topic(channel)
+        if parsed is None:
+            continue
+        ticket_kind, opener_id = parsed
+        if kind is not None and ticket_kind != kind:
+            continue
+        found.append((channel, ticket_kind, opener_id))
+    return found
+
+
 def _channel_name(kind: str, user: discord.abc.User) -> str:
     prefix = TICKET_KINDS[kind]["channel_prefix"]
     # Discord lowercases names and replaces awkward characters anyway; doing it
@@ -458,8 +493,17 @@ def _channel_name(kind: str, user: discord.abc.User) -> str:
     return f"{prefix}-{slug}"[:100]
 
 
-async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None:
-    """Creates the private channel for a ban appeal or a general question."""
+async def open_staff_ticket(
+    interaction: discord.Interaction,
+    kind: str,
+    details: dict[str, str] | None = None,
+) -> None:
+    """Creates the private channel for a ban appeal or a general question.
+
+    `details` is whatever a form asked for before the ticket existed (see
+    RecoverDetailsModal). Each entry becomes a field on the opening message so
+    staff read the answers instead of asking for them again.
+    """
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     if guild is None:
@@ -552,14 +596,21 @@ async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None
         return
 
     spec = TICKET_KINDS[kind]
+    intro = spec.get("intro_after_form", spec["intro"]) if details else spec["intro"]
     embed = discord.Embed(
         title=f"{spec['emoji']} {spec['label']}",
-        description=(
-            f"{interaction.user.mention} opened this ticket.\n\n" + spec["intro"]
-        ),
+        description=f"{interaction.user.mention} opened this ticket.\n\n" + intro,
         color=spec.get("color", EMBED_BLURPLE),
         timestamp=datetime.now(timezone.utc),
     )
+    for name, value in (details or {}).items():
+        # Escaped so a name full of underscores or asterisks reads as typed,
+        # and cut to Discord's 1024-char limit for a field value.
+        embed.add_field(
+            name=name,
+            value=discord.utils.escape_markdown(value)[:1024],
+            inline=False,
+        )
     embed.add_field(name="What happens next", value=STAFF_REPLY_NOTICE, inline=False)
     embed.set_footer(text=f"Opened by {interaction.user} • {interaction.user.id}")
 
@@ -583,6 +634,108 @@ async def open_staff_ticket(interaction: discord.Interaction, kind: str) -> None
         f"Opened your ticket: {channel.mention}", ephemeral=True
     )
     logger.info("Opened %s ticket %s for %s", kind, channel.id, interaction.user)
+
+
+class RecoverDetailsModal(discord.ui.Modal, title="Get your cosmetics back"):
+    """Asked before a recovery ticket exists, so staff open a channel that
+    already answers "who were you, and who are you now?".
+
+    Discord modals hold at most five components and cannot take a file upload,
+    which is why the photo is a link here and asked for again as an attachment
+    once the channel exists — dragging one in only works there.
+
+    Uses the Label/TextDisplay form of a modal, which is why requirements.txt
+    asks for discord.py 2.7 or newer.
+    """
+
+    # A plain paragraph at the top of the form: the title alone can't say why
+    # we're asking, and this is the last chance to before the ticket exists.
+    note = discord.ui.TextDisplay(
+        "So we can help you as quickly as possible, tell us what you were "
+        "called **before** and what you're called **now**. The last two are "
+        "optional, but they make it much faster to prove the account is yours."
+    )
+    old_name = discord.ui.Label(
+        text="Your OLD in-game name",
+        description="Spelled exactly as it was on the old app.",
+        component=discord.ui.TextInput(max_length=100, required=True),
+    )
+    new_name = discord.ui.Label(
+        text="Your NEW in-game name",
+        description="What the game calls you on the new app right now.",
+        component=discord.ui.TextInput(max_length=100, required=True),
+    )
+    owned = discord.ui.Label(
+        text="Cosmetics you owned (optional)",
+        description="Three you're sure about, and roughly how many shiny rocks you had.",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph, max_length=500, required=False
+        ),
+    )
+    proof = discord.ui.Label(
+        text="Photo of your new ID (optional)",
+        description="Or of your old account. Paste a link, or drag it in once the ticket opens.",
+        component=discord.ui.TextInput(max_length=300, required=False),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Each field is a Label wrapping the box that actually holds the text.
+        def answer(label: discord.ui.Label) -> str:
+            return (label.component.value or "").strip()
+
+        details = {
+            "Old in-game name": answer(self.old_name),
+            "New in-game name": answer(self.new_name),
+        }
+        if answer(self.owned):
+            details["What they had"] = answer(self.owned)
+        if answer(self.proof):
+            details["Photo / proof they sent"] = answer(self.proof)
+        await open_staff_ticket(interaction, "recover", details=details)
+
+    async def on_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        # Same reasoning as _TicketView.on_error: without this the form just
+        # closes and the answers they typed vanish with no explanation.
+        logger.exception("Recovery form failed", exc_info=error)
+        message = (
+            "Something broke on our end and your ticket wasn't opened — nothing "
+            "was lost. Try the button again, or tell a staff member."
+        )
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+        except discord.HTTPException:
+            logger.exception("Could not report the recovery form failure")
+
+
+async def start_recover_ticket(interaction: discord.Interaction) -> None:
+    """Shows the form, then opens the ticket from what it comes back with.
+
+    The duplicate check runs before the form rather than after it, so nobody
+    fills the whole thing in only to be told they already have one open. A
+    modal has to be the first response to the click, so nothing here may defer.
+    """
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "Tickets only work inside the server.", ephemeral=True
+        )
+        return
+
+    existing = find_open_ticket(guild, interaction.user.id, "recover")
+    if existing is not None:
+        await interaction.response.send_message(
+            f"You already have a **{TICKET_KINDS['recover']['label']}** ticket "
+            f"open: {existing.mention}",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_modal(RecoverDetailsModal())
 
 
 async def close_ticket(interaction: discord.Interaction) -> None:
@@ -702,7 +855,7 @@ class TicketPanelView(_TicketView):
     async def recover(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await open_staff_ticket(interaction, "recover")
+        await start_recover_ticket(interaction)
 
     @discord.ui.button(
         label="Ban appeal", emoji="⚖️",

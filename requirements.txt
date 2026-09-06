@@ -1,4 +1,6 @@
-discord.py>=2.3.2
+# 2.7 is the floor: the recovery form uses discord.ui.Label and
+# discord.ui.TextDisplay, which do not exist before it.
+discord.py>=2.7.0
 aiohttp>=3.9.0
 python-dotenv>=1.0.1
 pytesseract>=0.3.10
