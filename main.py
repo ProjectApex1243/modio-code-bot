@@ -1785,6 +1785,155 @@ def register_commands(tree: app_commands.CommandTree) -> None:
         )
 
     @tree.command(
+        name="close-all-tickets",
+        description="Delete every open ticket now (see /close-tickets to filter by age).",
+    )
+    @app_commands.describe(
+        kind="Only close this kind of ticket (blank = all of them)",
+        preview="Just list what would be closed, without closing anything",
+    )
+    @app_commands.choices(
+        kind=[
+            app_commands.Choice(name=spec["label"], value=key)
+            for key, spec in tickets.TICKET_KINDS.items()
+        ]
+    )
+    @app_commands.guild_only()
+    @app_commands.checks.has_role(STAFF_ROLE_NAME)
+    async def close_all_tickets_command(
+        interaction: discord.Interaction,
+        kind: app_commands.Choice[str] | None = None,
+        preview: bool = False,
+    ) -> None:
+        """The blunt version of /close-tickets: everything, right now.
+
+        /close-tickets is the one to reach for normally — it can spare tickets
+        someone is still talking in. This one is Staff-wide rather than Supa
+        Manager, takes no age filter, and can be run from inside a ticket.
+        """
+        # Ephemeral throughout: the reply would otherwise be posted into a
+        # channel this command is about to delete.
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        found = tickets.ticket_channels(guild, kind.value if kind else None)
+        what = f"**{kind.name}** ticket" if kind else "ticket"
+
+        if not found:
+            await interaction.followup.send(
+                f"Nothing to close — there are no open {what}s.", ephemeral=True
+            )
+            return
+
+        if not guild.me.guild_permissions.manage_channels:
+            await interaction.followup.send(
+                "I can't close tickets — I'm missing the **Manage Channels** "
+                "permission.",
+                ephemeral=True,
+            )
+            return
+
+        listing = [
+            f"{channel.mention} — {tickets.TICKET_KINDS[ticket_kind]['label']}, "
+            f"opened by <@{opener_id}>"
+            for channel, ticket_kind, opener_id in found
+        ]
+        shown = "\n".join(listing[:20])
+        if len(listing) > 20:
+            shown += f"\n…and {len(listing) - 20} more"
+
+        if preview:
+            await interaction.followup.send(
+                f"**Preview only — nothing was closed.**\n"
+                f"**{len(found)}** open {what}(s) would be deleted:\n{shown}",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        confirm_embed = discord.Embed(
+            title="⚠️ Confirm closing every ticket",
+            description=(
+                f"This deletes **{len(found)}** {what} channel(s) and "
+                "**everything written in them**, including any proof players "
+                "posted for a recovery. It cannot be undone.\n\n"
+                f"{shown}"
+            ),
+            color=EMBED_RED,
+        )
+        view = ConfirmView(interaction.user.id, "Delete them all", "Closing…")
+        await interaction.followup.send(
+            embed=confirm_embed,
+            view=view,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        if await view.wait():
+            await interaction.followup.send(
+                "Timed out — nothing was closed.", ephemeral=True
+            )
+            return
+        if not view.confirmed:
+            # ConfirmView already replaced the message with "Cancelled."
+            return
+
+        reason = f"Bulk ticket close by {interaction.user} ({interaction.user.id})"
+        here_id = getattr(interaction.channel, "id", None)
+        # Deleting the channel this was run in takes the follow-up messages
+        # with it, so if it's a ticket too it waits until after the summary.
+        this_channel = next((c for c, _, _ in found if c.id == here_id), None)
+        targets = [c for c, _, _ in found if c.id != here_id]
+
+        closed = 0
+        failed = 0
+        for index, channel in enumerate(targets):
+            try:
+                await channel.delete(reason=reason)
+                closed += 1
+            except discord.HTTPException as error:
+                failed += 1
+                logger.warning(
+                    "Could not delete ticket channel %s (%s): %s",
+                    channel, channel.id, error,
+                )
+            # Progress ping every 10 so a long sweep doesn't look frozen. Keyed
+            # to the position, not the count, or a failure right after the tenth
+            # would send the same line again.
+            if (index + 1) % 10 == 0:
+                await interaction.followup.send(
+                    f"…{index + 1}/{len(targets)} done so far.", ephemeral=True
+                )
+            if index < len(targets) - 1:
+                await asyncio.sleep(PRUNE_KICK_DELAY)
+
+        result = discord.Embed(
+            title="🔒 Tickets closed",
+            description=f"Deleted **{closed}** {what} channel(s)."
+            + (f"\n⚠️ **{failed}** could not be deleted (see bot logs)." if failed else "")
+            + (
+                "\n\nThis channel is a ticket too — it goes right after this "
+                "message, which is why it isn't counted above."
+                if this_channel
+                else ""
+            ),
+            color=EMBED_COLOR if not failed else EMBED_RED,
+        )
+        await interaction.followup.send(embed=result, ephemeral=True)
+        logger.info(
+            "%s bulk-closed %s ticket(s) (%s failed)%s",
+            interaction.user, closed, failed,
+            ", plus the channel it was run in" if this_channel else "",
+        )
+
+        if this_channel is not None:
+            try:
+                await this_channel.delete(reason=reason)
+            except discord.HTTPException:
+                logger.exception(
+                    "Could not delete the invoking ticket channel %s", this_channel.id
+                )
+
+    @tree.command(
         name="reset-cosmetic-claim",
         description="Let someone claim the Discord cosmetics again.",
     )
