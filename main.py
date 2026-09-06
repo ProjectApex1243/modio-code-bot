@@ -666,10 +666,12 @@ class RecoveryControlsView(discord.ui.View):
         await interaction.response.send_modal(RecoverUndoModal())
 
 
-async def _old_name_check_embed(
-    session, name: str
-) -> discord.Embed:
-    """Says whether any account actually carries the name the player typed.
+async def _check_old_name(session, name: str) -> tuple[bool, discord.Embed]:
+    """Is any account actually called this? Returns (yes/no, what to show).
+
+    The bool is what decides whether the form stops and warns before making a
+    ticket; the embed is shown either way, and ends up in the channel so staff
+    see the same answer the player got.
 
     Counts only, never names or ids. This message lands in the ticket, which
     the player can read, and two accounts can share a name - the same reason
@@ -693,7 +695,7 @@ async def _old_name_check_embed(
         count = len(exact)
         capped = "+" if len(matches) >= NAME_CHECK_LIMIT else ""
         if count == 1:
-            return discord.Embed(
+            return True, discord.Embed(
                 title="✅ That name exists",
                 description=(
                     f"One account is named **{shown}**.\n"
@@ -701,7 +703,7 @@ async def _old_name_check_embed(
                 ),
                 color=EMBED_COLOR,
             )
-        return discord.Embed(
+        return True, discord.Embed(
             title="✅ That name exists",
             description=(
                 f"**{count}{capped}** accounts are named **{shown}**, so the "
@@ -715,7 +717,7 @@ async def _old_name_check_embed(
         session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, name, limit=NAME_CHECK_LIMIT
     )
     if near:
-        return discord.Embed(
+        return False, discord.Embed(
             title="⚠️ No exact match for that name",
             description=(
                 f"Nothing is named exactly **{shown}**, but **{len(near)}** "
@@ -727,7 +729,7 @@ async def _old_name_check_embed(
             color=tickets.EMBED_BLURPLE,
         )
 
-    return discord.Embed(
+    return False, discord.Embed(
         title="⚠️ No account found with that name",
         description=(
             f"Nothing in the database matches **{shown}**, even partially.\n\n"
@@ -739,9 +741,29 @@ async def _old_name_check_embed(
     )
 
 
-async def _post_recovery_controls(
-    channel: discord.TextChannel, details: dict[str, str], client: discord.Client
-) -> None:
+async def _old_name_lookup(
+    client: discord.Client, name: str
+) -> tuple[bool, discord.Embed] | None:
+    """tickets.OLD_NAME_CHECK: the recovery form's "does this name exist?".
+
+    None means the question could not be answered, and the form then opens the
+    ticket without comment. Refusing to make a ticket because our own database
+    is unreachable would be the worst possible reading of a name check.
+    """
+    if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+        logger.warning("No service key, so the recovery form can't check names.")
+        return None
+    try:
+        return await _check_old_name(client.http_session, name)
+    except Exception:
+        logger.exception("Old-name check failed for %r", name)
+        return None
+
+
+tickets.OLD_NAME_CHECK = _old_name_lookup
+
+
+async def _post_recovery_controls(channel: discord.TextChannel) -> None:
     """Hooked into tickets.TICKET_OPENED_HOOKS["recover"] so tickets.py can
     post this without importing main.py (it defines the reverse import)."""
     await channel.send(
@@ -755,33 +777,6 @@ async def _post_recovery_controls(
         ),
         view=RecoveryControlsView(),
     )
-
-    # Check the name the form collected, so a typo surfaces now rather than
-    # after a day of waiting for a staff member to type it in by hand.
-    old_name = (details.get(tickets.OLD_NAME_FIELD) or "").strip()
-    if not old_name:
-        return
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        logger.warning("No service key, so the old name in %s went unchecked.", channel.id)
-        return
-
-    try:
-        embed = await _old_name_check_embed(client.http_session, old_name)
-    except Exception as error:
-        # Never let a lookup failure cost the player their ticket - it is
-        # already open, and staff can still look the name up by hand.
-        logger.exception("Could not check the old name from ticket %s", channel.id)
-        embed = discord.Embed(
-            title="Name not checked",
-            description=(
-                "The bot couldn't reach the database to check this name, so "
-                "staff will need to look it up by hand.\n"
-                f"```\n{tickets.describe_error(error)}\n```"
-            ),
-            color=EMBED_RED,
-        )
-
-    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 tickets.TICKET_OPENED_HOOKS["recover"] = _post_recovery_controls

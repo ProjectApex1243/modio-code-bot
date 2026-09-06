@@ -37,10 +37,26 @@ DEFAULT_COSMETIC_ITEMS = ["DiscordStick", "Discord Badge", "Discord Claim thing"
 CLAIM_CODE_MAX_USES = 1
 CLAIM_CODE_EXPIRY = timedelta(days=1)
 
-# The label the recovery form files the old name under. main.py reads the
-# answer back out by this name to check it against the profiles table, so it
-# is a constant rather than a string repeated in two files.
+# The labels the recovery form files its answers under. They are constants
+# because three other things read them back: main.py checks the old name
+# against the profiles table, the ticket embed shows them, and re-opening the
+# form after a bad name prefills it from them.
 OLD_NAME_FIELD = "Old in-game name"
+NEW_NAME_FIELD = "New in-game name"
+OWNED_FIELD = "What they had"
+PROOF_FIELD = "Photo / proof they sent"
+
+# main.py fills this in (it imports tickets, never the other way round) with a
+# lookup that answers "does any account actually carry this name?". It returns
+# (found, embed describing what was found), or None when it couldn't check -
+# a database that isn't answering must not stop anyone opening a ticket.
+OLD_NAME_CHECK: (
+    Callable[[discord.Client, str], Awaitable[tuple[bool, discord.Embed] | None]] | None
+) = None
+
+# How long the "that name matched nothing" buttons stay live. Long enough to
+# go and check a spelling in game, short enough that it isn't left dangling.
+UNKNOWN_NAME_TIMEOUT = 600
 
 STAFF_REPLY_NOTICE = (
     "A staff member will come to help you whenever they can — please be "
@@ -139,12 +155,7 @@ TICKET_KINDS = {
 # the only direction that can't be a plain import) so a ticket kind can post
 # extra staff controls right after opening - see open_staff_ticket below and
 # main.py's _post_recovery_controls.
-TICKET_OPENED_HOOKS: dict[
-    str,
-    Callable[
-        [discord.TextChannel, dict[str, str], discord.Client], Awaitable[None]
-    ],
-] = {}
+TICKET_OPENED_HOOKS: dict[str, Callable[[discord.TextChannel], Awaitable[None]]] = {}
 
 
 def cosmetic_items() -> list[str]:
@@ -507,14 +518,21 @@ async def open_staff_ticket(
     interaction: discord.Interaction,
     kind: str,
     details: dict[str, str] | None = None,
+    extra_embed: discord.Embed | None = None,
 ) -> None:
     """Creates the private channel for a ban appeal or a general question.
 
     `details` is whatever a form asked for before the ticket existed (see
     RecoverDetailsModal). Each entry becomes a field on the opening message so
     staff read the answers instead of asking for them again.
+
+    `extra_embed` is posted underneath it — the recovery form uses it to hand
+    over the name check it already ran, so the lookup isn't repeated here.
     """
-    await interaction.response.defer(ephemeral=True)
+    # The form defers before its own lookup, and the "open it anyway" button
+    # arrives fresh, so this has to cope with both.
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
     if guild is None:
         await interaction.followup.send(
@@ -633,10 +651,15 @@ async def open_staff_ticket(
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
+    if extra_embed is not None:
+        await channel.send(
+            embed=extra_embed, allowed_mentions=discord.AllowedMentions.none()
+        )
+
     hook = TICKET_OPENED_HOOKS.get(kind)
     if hook is not None:
         try:
-            await hook(channel, details or {}, interaction.client)
+            await hook(channel)
         except Exception:
             # Deliberately broader than HTTPException: a hook that reaches the
             # database can fail in ways that have nothing to do with Discord,
@@ -692,6 +715,18 @@ class RecoverDetailsModal(discord.ui.Modal, title="Get your cosmetics back"):
         component=discord.ui.TextInput(max_length=300, required=False),
     )
 
+    def __init__(self, prefill: dict[str, str] | None = None) -> None:
+        super().__init__()
+        # Re-opened after a name that matched nothing: everything they typed
+        # comes back with it, so only the spelling has to be fixed.
+        for field, label in (
+            (OLD_NAME_FIELD, self.old_name),
+            (NEW_NAME_FIELD, self.new_name),
+            (OWNED_FIELD, self.owned),
+            (PROOF_FIELD, self.proof),
+        ):
+            label.component.default = (prefill or {}).get(field) or None
+
     async def on_submit(self, interaction: discord.Interaction) -> None:
         # Each field is a Label wrapping the box that actually holds the text.
         def answer(label: discord.ui.Label) -> str:
@@ -699,13 +734,43 @@ class RecoverDetailsModal(discord.ui.Modal, title="Get your cosmetics back"):
 
         details = {
             OLD_NAME_FIELD: answer(self.old_name),
-            "New in-game name": answer(self.new_name),
+            NEW_NAME_FIELD: answer(self.new_name),
         }
         if answer(self.owned):
-            details["What they had"] = answer(self.owned)
+            details[OWNED_FIELD] = answer(self.owned)
         if answer(self.proof):
-            details["Photo / proof they sent"] = answer(self.proof)
-        await open_staff_ticket(interaction, "recover", details=details)
+            details[PROOF_FIELD] = answer(self.proof)
+
+        # Deferred here rather than in open_staff_ticket, because the lookup
+        # below happens before we know whether a ticket is being made at all.
+        await interaction.response.defer(ephemeral=True)
+
+        checked = None
+        if OLD_NAME_CHECK is not None:
+            checked = await OLD_NAME_CHECK(interaction.client, details[OLD_NAME_FIELD])
+
+        if checked is not None and not checked[0]:
+            # Nothing carries that name. Say so now, while fixing it is free -
+            # the alternative is a channel that sits there for a day before a
+            # staff member types the same name in and finds the same nothing.
+            view = UnknownNameView(details, checked[1])
+            view.message = await interaction.followup.send(
+                content=(
+                    "**Your ticket hasn't been made yet.** Have a look at this "
+                    "first — if the name is wrong, fixing it now saves you the "
+                    "wait."
+                ),
+                embed=checked[1],
+                view=view,
+                ephemeral=True,
+                wait=True,
+            )
+            return
+
+        await open_staff_ticket(
+            interaction, "recover", details=details,
+            extra_embed=checked[1] if checked else None,
+        )
 
     async def on_error(
         self, interaction: discord.Interaction, error: Exception
@@ -724,6 +789,59 @@ class RecoverDetailsModal(discord.ui.Modal, title="Get your cosmetics back"):
                 await interaction.response.send_message(message, ephemeral=True)
         except discord.HTTPException:
             logger.exception("Could not report the recovery form failure")
+
+
+class UnknownNameView(discord.ui.View):
+    """Offered when the old name from the form matched no account.
+
+    Not a persistent view and deliberately without fixed custom_ids: it is
+    sent ephemerally, and a registered custom_id on an ephemeral view is what
+    kills the panel's buttons for everyone when the copy expires. See
+    help_menu_embed for the full story.
+    """
+
+    def __init__(self, details: dict[str, str], check_embed: discord.Embed) -> None:
+        super().__init__(timeout=UNKNOWN_NAME_TIMEOUT)
+        self.details = details
+        self.check_embed = check_embed
+        # Set by the caller so on_timeout can clear the buttons off the screen
+        # instead of leaving two that no longer do anything.
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=(
+                    "This timed out and **no ticket was made**. Press "
+                    "**Get your cosmetics back** on the panel to start again."
+                ),
+                embed=None,
+                view=None,
+            )
+        except discord.HTTPException:
+            logger.debug("Could not clear an expired name warning", exc_info=True)
+
+    @discord.ui.button(label="Fix the name", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def fix(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        # A button click is its own interaction, so the form can be re-opened
+        # here even though the first one was already answered.
+        await interaction.response.send_modal(RecoverDetailsModal(self.details))
+        self.stop()
+
+    @discord.ui.button(
+        label="Open the ticket anyway", emoji="📨", style=discord.ButtonStyle.secondary
+    )
+    async def anyway(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        self.stop()
+        await open_staff_ticket(
+            interaction, "recover", details=self.details, extra_embed=self.check_embed
+        )
 
 
 async def start_recover_ticket(interaction: discord.Interaction) -> None:
