@@ -59,6 +59,9 @@ UNVERIFIED_ROLE_NAME = "Unverified"
 PRUNE_KICK_DELAY = 1.0
 # How long confirmation buttons stay clickable.
 CONFIRM_TIMEOUT = 120
+# Rows pulled when checking the name a recovery form collected. Only the count
+# is ever shown, so this is a ceiling on "N accounts", not a page size.
+NAME_CHECK_LIMIT = 25
 # /leaderboard default and cap (the manual SQL used LIMIT 50).
 LEADERBOARD_DEFAULT = 10
 LEADERBOARD_MAX = 50
@@ -663,7 +666,82 @@ class RecoveryControlsView(discord.ui.View):
         await interaction.response.send_modal(RecoverUndoModal())
 
 
-async def _post_recovery_controls(channel: discord.TextChannel) -> None:
+async def _old_name_check_embed(
+    session, name: str
+) -> discord.Embed:
+    """Says whether any account actually carries the name the player typed.
+
+    Counts only, never names or ids. This message lands in the ticket, which
+    the player can read, and two accounts can share a name - the same reason
+    RecoverLookupModal keeps its results ephemeral. Staff still press **Look
+    up account** to see which account is which.
+    """
+    shown = discord.utils.escape_markdown(name)
+
+    matches = await supa_admin.find_accounts_by_name(
+        session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, name, limit=NAME_CHECK_LIMIT
+    )
+    # ILIKE treats _ as "any character", so "Old_Zed" comes back matching
+    # "OldXZed" too. Settle it here rather than trusting the filter.
+    wanted = name.strip().casefold()
+    exact = [
+        row for row in matches
+        if str(row.get("display_name", "")).strip().casefold() == wanted
+    ]
+
+    if exact:
+        count = len(exact)
+        capped = "+" if len(matches) >= NAME_CHECK_LIMIT else ""
+        if count == 1:
+            return discord.Embed(
+                title="✅ That name exists",
+                description=(
+                    f"One account is named **{shown}**.\n"
+                    "Staff: press **Look up account** below for its details."
+                ),
+                color=EMBED_COLOR,
+            )
+        return discord.Embed(
+            title="✅ That name exists",
+            description=(
+                f"**{count}{capped}** accounts are named **{shown}**, so the "
+                "cosmetics and shiny rocks you listed are how we tell them "
+                "apart. Staff: press **Look up account** below."
+            ),
+            color=EMBED_COLOR,
+        )
+
+    near = await supa_admin.find_accounts_like_name(
+        session, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, name, limit=NAME_CHECK_LIMIT
+    )
+    if near:
+        return discord.Embed(
+            title="⚠️ No exact match for that name",
+            description=(
+                f"Nothing is named exactly **{shown}**, but **{len(near)}** "
+                "name(s) contain it — so this is probably a spelling, spacing "
+                "or capitalisation slip.\n\n"
+                "**Post the exact spelling** if it comes back to you. Staff can "
+                "search around it either way."
+            ),
+            color=tickets.EMBED_BLURPLE,
+        )
+
+    return discord.Embed(
+        title="⚠️ No account found with that name",
+        description=(
+            f"Nothing in the database matches **{shown}**, even partially.\n\n"
+            "That usually means a different spelling, or that the account went "
+            "by another name. Post any other names you used and staff will "
+            "search those too."
+        ),
+        color=EMBED_RED,
+    )
+
+
+async def _post_recovery_controls(
+    channel: discord.TextChannel, details: dict[str, str], client: discord.Client
+) -> None:
     """Hooked into tickets.TICKET_OPENED_HOOKS["recover"] so tickets.py can
     post this without importing main.py (it defines the reverse import)."""
     await channel.send(
@@ -677,6 +755,33 @@ async def _post_recovery_controls(channel: discord.TextChannel) -> None:
         ),
         view=RecoveryControlsView(),
     )
+
+    # Check the name the form collected, so a typo surfaces now rather than
+    # after a day of waiting for a staff member to type it in by hand.
+    old_name = (details.get(tickets.OLD_NAME_FIELD) or "").strip()
+    if not old_name:
+        return
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("No service key, so the old name in %s went unchecked.", channel.id)
+        return
+
+    try:
+        embed = await _old_name_check_embed(client.http_session, old_name)
+    except Exception as error:
+        # Never let a lookup failure cost the player their ticket - it is
+        # already open, and staff can still look the name up by hand.
+        logger.exception("Could not check the old name from ticket %s", channel.id)
+        embed = discord.Embed(
+            title="Name not checked",
+            description=(
+                "The bot couldn't reach the database to check this name, so "
+                "staff will need to look it up by hand.\n"
+                f"```\n{tickets.describe_error(error)}\n```"
+            ),
+            color=EMBED_RED,
+        )
+
+    await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 tickets.TICKET_OPENED_HOOKS["recover"] = _post_recovery_controls

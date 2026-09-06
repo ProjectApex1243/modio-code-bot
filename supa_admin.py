@@ -627,6 +627,34 @@ async def find_accounts_by_name(
     ) or []
 
 
+async def find_accounts_like_name(
+    session, supabase_url, key, display_name: str, limit: int = 25
+) -> list[dict]:
+    """Accounts whose in-game name *contains* the given text.
+
+    The fallback for when the exact match finds nothing: it turns "no account
+    by that name" into "no account by that name, but three that look like it",
+    which is nearly always a capitalisation or spacing slip rather than the
+    player misremembering who they were.
+
+    PostgREST reads * as its wildcard and hands the rest to SQL ILIKE, so the
+    caller's own *, % and _ are dropped first. A name with an underscore in it
+    would otherwise match any character in that position, and a lone % would
+    match every row in the table.
+    """
+    needle = re.sub(r"[*%_]", "", display_name.strip())
+    if not needle:
+        return []
+    return await _rest(
+        session, "GET", supabase_url, key, PROFILES_TABLE,
+        params={
+            "select": "user_id,display_name",
+            "display_name": f"ilike.*{needle}*",
+            "limit": str(limit),
+        },
+    ) or []
+
+
 async def account_snapshot(session, supabase_url, key, user_id: str) -> dict:
     """Enough about one account for staff to tell two same-named players apart."""
     items = await fetch_inventory(session, supabase_url, key, user_id)

@@ -37,6 +37,11 @@ DEFAULT_COSMETIC_ITEMS = ["DiscordStick", "Discord Badge", "Discord Claim thing"
 CLAIM_CODE_MAX_USES = 1
 CLAIM_CODE_EXPIRY = timedelta(days=1)
 
+# The label the recovery form files the old name under. main.py reads the
+# answer back out by this name to check it against the profiles table, so it
+# is a constant rather than a string repeated in two files.
+OLD_NAME_FIELD = "Old in-game name"
+
 STAFF_REPLY_NOTICE = (
     "A staff member will come to help you whenever they can — please be "
     "patient. Leave any extra details here in the meantime."
@@ -134,7 +139,12 @@ TICKET_KINDS = {
 # the only direction that can't be a plain import) so a ticket kind can post
 # extra staff controls right after opening - see open_staff_ticket below and
 # main.py's _post_recovery_controls.
-TICKET_OPENED_HOOKS: dict[str, Callable[[discord.TextChannel], Awaitable[None]]] = {}
+TICKET_OPENED_HOOKS: dict[
+    str,
+    Callable[
+        [discord.TextChannel, dict[str, str], discord.Client], Awaitable[None]
+    ],
+] = {}
 
 
 def cosmetic_items() -> list[str]:
@@ -626,8 +636,12 @@ async def open_staff_ticket(
     hook = TICKET_OPENED_HOOKS.get(kind)
     if hook is not None:
         try:
-            await hook(channel)
-        except discord.HTTPException:
+            await hook(channel, details or {}, interaction.client)
+        except Exception:
+            # Deliberately broader than HTTPException: a hook that reaches the
+            # database can fail in ways that have nothing to do with Discord,
+            # and the ticket itself already exists by this point. Losing the
+            # staff controls is worth a log line, not a failed ticket.
             logger.exception("Post-open hook for %s ticket failed", kind)
 
     await interaction.followup.send(
@@ -684,7 +698,7 @@ class RecoverDetailsModal(discord.ui.Modal, title="Get your cosmetics back"):
             return (label.component.value or "").strip()
 
         details = {
-            "Old in-game name": answer(self.old_name),
+            OLD_NAME_FIELD: answer(self.old_name),
             "New in-game name": answer(self.new_name),
         }
         if answer(self.owned):
